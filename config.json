@@ -1,0 +1,155 @@
+{
+  "timezone": "Asia/Shanghai",
+  "daily_time": "09:00",
+  "initial_lookback_days": 3,
+  "overlap_hours": 48,
+  "top_n": 10,
+  "preferred_keywords": ["开源", "效率", "自动化", "独立开发", "工具", "workflow", "productivity", "open source", "automation"],
+  "http_timeout_seconds": 25,
+  "http_attempts": 3,
+  "request_interval_seconds": 0.4,
+  "max_requests_per_source": 200,
+  "report": {
+    "daily_feature_count": 4,
+    "daily_insight_count": 2,
+    "daily_max_chars": 6000,
+    "repeat_suppression_days": 30
+  },
+  "llm": {
+    "enabled": true,
+    "provider": "deepseek",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-flash",
+    "api_key_env": "LLM_API_KEY",
+    "focus": "关注产品的核心功能、定位、客户和衍生思考；优先个人或小团队可借鉴的产品。",
+    "batch_size": 16,
+    "concurrency": 3,
+    "deep_dive_count": 12,
+    "max_items_per_run": 1200,
+    "max_calls_per_run": 120,
+    "timeout_seconds": 240,
+    "max_attempts": 2,
+    "screen_max_tokens": 12000,
+    "deep_max_tokens": 24000,
+    "history_days": 7,
+    "fetch_product_pages": true,
+    "page_timeout_seconds": 18,
+    "evidence_max_chars": 12000
+  },
+  "sources": [
+    {
+      "id": "show_hn",
+      "name": "Show HN",
+      "kind": "hn_search",
+      "enabled": true,
+      "url": "https://hn.algolia.com/api/v1/search_by_date"
+    },
+    {
+      "id": "hn_startup_discussions",
+      "name": "Hacker News 创业讨论",
+      "kind": "hn_search",
+      "enabled": true,
+      "url": "https://hn.algolia.com/api/v1/search_by_date",
+      "tags": "story",
+      "query": "startup",
+      "min_points": 10
+    },
+    {
+      "id": "yc_launches",
+      "name": "YC Launches / Launch HN",
+      "kind": "hn_search",
+      "enabled": true,
+      "url": "https://hn.algolia.com/api/v1/search_by_date",
+      "tags": "story",
+      "query": "Launch HN:"
+    },
+    {
+      "id": "product_hunt",
+      "name": "Product Hunt",
+      "kind": "rss",
+      "enabled": true,
+      "url": "https://www.producthunt.com/feed"
+    },
+    {
+      "id": "github_trending",
+      "name": "GitHub Trending",
+      "kind": "github_trending",
+      "enabled": true,
+      "url": "https://github.com/trending?since=daily"
+    },
+    {
+      "id": "reddit_sideproject",
+      "name": "Reddit r/SideProject",
+      "kind": "rss",
+      "enabled": true,
+      "url": "https://www.reddit.com/r/SideProject/new/.rss"
+    },
+    {
+      "id": "reddit_saas",
+      "name": "Reddit r/SaaS",
+      "kind": "rss",
+      "enabled": true,
+      "url": "https://www.reddit.com/r/SaaS/new/.rss"
+    },
+    {
+      "id": "reddit_indiehackers",
+      "name": "Reddit r/indiehackers",
+      "kind": "rss",
+      "enabled": true,
+      "url": "https://www.reddit.com/r/indiehackers/new/.rss"
+    },
+    {
+      "id": "reddit_startups",
+      "name": "Reddit r/startups",
+      "kind": "rss",
+      "enabled": true,
+      "url": "https://www.reddit.com/r/startups/new/.rss"
+    },
+    {
+      "id": "appinn",
+      "name": "小众软件",
+      "kind": "paged_rss",
+      "enabled": true,
+      "url": "https://www.appinn.com/feed/?paged={page}"
+    },
+    {
+      "id": "v2ex_create",
+      "name": "V2EX 分享创造",
+      "kind": "rss",
+      "enabled": true,
+      "url": "https://www.v2ex.com/feed/create.xml"
+    },
+    {
+      "id": "indie_hackers_products",
+      "name": "Indie Hackers Products",
+      "kind": "unavailable",
+      "enabled": false,
+      "url": "https://www.indiehackers.com/products",
+      "note": "当前没有稳定公开 API/RSS，自动请求被 Cloudflare 拦截。"
+    },
+    {
+      "id": "betalist",
+      "name": "BetaList",
+      "kind": "unavailable",
+      "enabled": false,
+      "url": "https://betalist.com/",
+      "note": "未发现稳定公开 API/RSS；保留配置位，避免不可靠网页解析污染日报。"
+    },
+    {
+      "id": "uneed",
+      "name": "Uneed",
+      "kind": "unavailable",
+      "enabled": false,
+      "url": "https://www.uneed.best/",
+      "note": "当前没有稳定公开 API/RSS，自动请求被 Cloudflare 拦截。"
+    },
+    {
+      "id": "peerlist_launchpad",
+      "name": "Peerlist Launchpad",
+      "kind": "unavailable",
+      "enabled": false,
+      "url": "https://peerlist.io/launchpad",
+      "note": "当前没有稳定公开 API/RSS，自动请求被 Cloudflare 拦截。"
+    }
+  ]
+}
