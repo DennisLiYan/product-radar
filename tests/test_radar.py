@@ -167,6 +167,7 @@ class CollectorTests(unittest.TestCase):
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
             self.assertEqual(query["tags"], ["story"])
             self.assertEqual(query["query"], ["startup"])
+            self.assertIn("points>=10", query["numericFilters"][0])
             hits = [
                 {"objectID": "strong", "created_at_i": self.now - 2, "title": "A startup product",
                  "url": "https://example.org/strong", "points": 12},
@@ -197,6 +198,125 @@ class CollectorTests(unittest.TestCase):
         self.assertIn("A & B automation tool", items[0].description)
         with self.assertRaises(ValueError):
             radar.parse_github_trending(b"<html>rate limited</html>", self.now)
+
+    def test_hn_thread_keeps_linked_top_level_replies(self):
+        thread = {"objectID": "100", "title": "Ask HN: What are you working on? (October 2026)",
+                  "created_at_i": self.now - 5 * 86400}
+        other = {"objectID": "200", "title": "Ask HN: Who is hiring?", "created_at_i": self.now - 86400}
+        text = "I'm building Acme. A tool that turns invoices into ledgers for small shops. "
+        comments = [
+            {"objectID": "1", "parent_id": 100, "created_at_i": self.now - 60,
+             "comment_text": text + '<a href="https:&#x2F;&#x2F;acme.example&#x2F;">acme.example</a>'},
+            {"objectID": "2", "parent_id": 1, "created_at_i": self.now - 50,
+             "comment_text": "Nice! " + text + '<a href="https://reply.example/">x</a>'},
+            {"objectID": "3", "parent_id": 100, "created_at_i": self.now - 40, "comment_text": text},
+            {"objectID": "4", "parent_id": 100, "created_at_i": self.now - 30,
+             "comment_text": 'Short <a href="https://short.example/">x</a>'},
+        ]
+
+        def respond(path):
+            tags = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)["tags"][0]
+            hits = [thread, other] if tags.startswith("story,author_") else comments
+            return 200, {"hits": hits, "nbHits": len(hits), "nbPages": 1, "hitsPerPage": 100}
+
+        with Server(respond) as server:
+            source = {"id": "thread", "name": "Thread", "kind": "hn_thread", "url": server.url,
+                      "author": "david927", "thread_query": "What are you working on",
+                      "title_pattern": "^Ask HN: What are you working on\\?", "min_chars": 40}
+            self.assertEqual(self.collect(source, self.now), "ok")
+            self.assertTrue(any("story_100" in urllib.parse.unquote(p) for p in server.requests))
+            self.assertFalse(any("story_200" in urllib.parse.unquote(p) for p in server.requests))
+        rows = list(self.db.execute("SELECT * FROM items"))
+        self.assertEqual([r["external_id"] for r in rows], ["1"])
+        self.assertEqual(rows[0]["url"], "https://acme.example/")
+        self.assertEqual(rows[0]["title"], "I'm building Acme.")
+        self.assertEqual(rows[0]["discussion_url"], "https://news.ycombinator.com/item?id=1")
+
+    def test_hellogithub_splits_issue_into_projects(self):
+        data = {"props": {"pageProps": {"volume": {"data": [{"category_name": "Python 项目", "items": [
+            {"full_name": "Acme/Tool", "github_url": "https://github.com/Acme/Tool",
+             "description": "命令行效率工具", "stars": 42},
+            {"full_name": "", "github_url": ""}]}]}}}}
+        page = ('<html><script id="__NEXT_DATA__" type="application/json">%s</script></html>'
+                % json.dumps(data, ensure_ascii=False)).encode()
+
+        def respond(path):
+            if path.startswith("/periodical/"):
+                return 200, page
+            return 200, ("<rss><channel><item><guid>v1</guid><title>HelloGitHub 第 1 期</title>"
+                         "<link>%speriodical/volume/1</link><pubDate>%s</pubDate></item></channel></rss>"
+                         % (server.url, radar.stamp(self.now - 3600))).encode()
+
+        with Server(respond) as server:
+            source = {"id": "hg", "name": "HelloGitHub", "kind": "hellogithub", "url": server.url + "rss"}
+            self.assertEqual(self.collect(source, self.now), "ok")
+            issue = server.url + "periodical/volume/1"
+        row = self.db.execute("SELECT * FROM items").fetchone()
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM items").fetchone()[0], 1)
+        self.assertEqual((row["external_id"], row["url"]), ("acme/tool", "https://github.com/Acme/Tool"))
+        self.assertEqual(row["discussion_url"], radar.canonical_url(issue))
+        self.assertIn("命令行效率工具", row["description"])
+        with self.assertRaises(ValueError):
+            radar.parse_hellogithub_volume(b"<html></html>", issue, self.now)
+
+    def test_hf_spaces_snapshot_keeps_recent_spaces(self):
+        spaces = [{"id": "acme/Demo", "createdAt": radar.stamp(self.now - 86400), "likes": 7, "sdk": "gradio",
+                   "cardData": {"title": "Acme Demo", "short_description": "Turns photos into floor plans"}},
+                  {"id": "old/Space", "createdAt": radar.stamp(self.now - 90 * 86400), "likes": 900}]
+        with Server(lambda p: (200, json.dumps(spaces).encode())) as server:
+            source = {"id": "hf", "name": "HF", "kind": "hf_spaces", "url": server.url, "max_age_days": 30}
+            self.assertEqual(self.collect(source, self.now), "limited")
+        rows = list(self.db.execute("SELECT * FROM items"))
+        self.assertEqual([r["external_id"] for r in rows], ["acme/demo"])
+        self.assertEqual(rows[0]["title"], "Acme Demo")
+        self.assertEqual(rows[0]["url"], "https://huggingface.co/spaces/acme/Demo")
+        self.assertIn("Turns photos into floor plans", rows[0]["description"])
+
+    def test_sitemap_filters_product_paths_and_uses_update_date(self):
+        body = b'''<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+        <url><loc>https://www.ycombinator.com/launches/ABC-useful-product</loc><lastmod>2026-10-10</lastmod></url>
+        <url><loc>https://www.ycombinator.com/launches/sitemap</loc><lastmod>2026-10-11</lastmod></url>
+        <url><loc>https://www.ycombinator.com/about</loc><lastmod>2026-10-11</lastmod></url>
+        </urlset>'''
+        source = {"path_pattern": r"^/launches/[^/]+$", "exclude_paths": ["/launches/sitemap"],
+                  "strip_code_prefix": True}
+        items, skipped = radar.parse_sitemap(body, source)
+        self.assertEqual(skipped, 0)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].title, "useful product")
+        self.assertEqual(items[0].published_at, radar.parse_time("2026-10-10T00:00:00Z"))
+
+    def test_yc_launches_uses_created_at_and_product_url(self):
+        class Client:
+            def json(inner, url):
+                return {"hits": [
+                    {"id": 7, "title": "Acme: useful product", "tagline": "One clear job",
+                     "slug": "ABC-acme", "created_at": radar.stamp(self.now - 2), "total_vote_count": 9,
+                     "search_path": "https://www.ycombinator.com/launches/ABC-acme",
+                     "company": {"url": "https://acme.example/", "tags": ["SaaS"], "batch": "Fall 2026"}},
+                    {"id": 6, "title": "Older", "tagline": "Old", "slug": "XYZ-older",
+                     "created_at": radar.stamp(self.now - 20), "total_vote_count": 1,
+                     "search_path": "https://www.ycombinator.com/launches/XYZ-older", "company": {}},
+                ], "nbPages": 1}
+
+        result = radar.collect_yc_launches({"url": "https://example.test/?page={page}"},
+                                           self.now - 10, self.now, Client())
+        self.assertEqual(len(result.items), 1)
+        self.assertEqual(result.items[0].external_id, "7")
+        self.assertEqual(result.items[0].url, "https://acme.example/")
+        self.assertEqual(result.items[0].points, 9)
+        self.assertIn("Fall 2026", result.items[0].description)
+
+    def test_betalist_parser_ignores_undated_trending_cards(self):
+        body = b'''<a href="/startups/trending"><div class="font-medium text-gray-900">Trending</div></a>
+        <div data-duplicate-id="day_1791590400"><strong>Yesterday</strong></div>
+        <div class="startup-row"><a class="absolute inset-0" href="/startups/useful"></a>
+        <span class="shrink-0 font-medium text-gray-900">Useful</span>
+        <span class="text-base text-gray-500 lg:truncate">Does one useful job</span></div>'''
+        items = radar.parse_betalist(body)
+        self.assertEqual([item.external_id for item in items], ["useful"])
+        self.assertEqual(items[0].title, "Useful")
+        self.assertEqual(items[0].description, "Does one useful job")
 
     def test_source_commit_rolls_back_items_and_checkpoint_together(self):
         # Force a DB write failure on the second item, after the first INSERT.
@@ -231,6 +351,30 @@ class CollectorTests(unittest.TestCase):
         self.assertTrue(spec["RunAtLoad"])
         self.assertIn("--if-due", spec["ProgramArguments"])
         self.assertNotIn("KeepAlive", spec)
+
+    def test_proxy_has_an_explicit_switch(self):
+        config = {"proxy_enabled": True, "proxy_url": "http://127.0.0.1:1087"}
+        self.assertEqual(radar.effective_proxy(config), "http://127.0.0.1:1087")
+        config["proxy_enabled"] = False
+        self.assertIsNone(radar.effective_proxy(config))
+
+    def test_linux_and_windows_schedules(self):
+        service, timer = schedule.systemd_units(self.root, "/usr/bin/python3", self.config)
+        self.assertIn("radar.py\" \"run\" \"--if-due\"", service)
+        self.assertIn("OnCalendar=*-*-* 09:00:00 " + self.config["timezone"], timer)
+        self.assertIn("Persistent=true", timer)
+        daily, reboot = schedule.cron_lines(self.root, "/usr/bin/python3", self.config)
+        self.assertTrue(daily.startswith("0 9 * * * ") and reboot.startswith("@reboot "))
+        self.assertTrue(daily.endswith(schedule.CRON_MARK + str(self.root)))
+        xml = schedule.windows_task_xml(self.root, "C:\\Python\\python.exe", self.config, "PC\\me")
+        import xml.etree.ElementTree as ET
+        task = ET.fromstring(xml.encode("utf-16"))
+        ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+        self.assertEqual(task.find(".//t:CalendarTrigger/t:StartBoundary", ns).text[-8:], "09:00:00")
+        self.assertIsNotNone(task.find(".//t:LogonTrigger", ns))
+        self.assertEqual(task.find(".//t:StartWhenAvailable", ns).text, "true")
+        self.assertIn("--if-due", task.find(".//t:Arguments", ns).text)
+        self.assertIn(schedule.windows_marker(self.root), xml)
 
     def test_exclusive_process_lock_and_atomic_report(self):
         lock = self.root / "run.lock"

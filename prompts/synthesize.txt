@@ -1,4 +1,4 @@
-综合输入 screened（全量产品卡片）、deep_dives（重点产品档案）、history（此前日报）与 coverage（样本边界），为产品观察日报写横向编辑内容。产品档案会作为正文主体，你的工作是帮助读者在看完单个产品后理解它们之间的关系。
+综合输入 screened（程序排序后的候选产品卡片；全部样本的类别分布见 coverage.category_counts）、deep_dives（重点产品档案）、history（此前日报）与 coverage（样本边界），为产品观察日报写横向编辑内容。产品档案会作为正文主体，你的工作是帮助读者在看完单个产品后理解它们之间的关系。
 
 重点回答：
 1. 本批出现了哪些类型的产品，最值得认识的是哪些，原因是什么。
@@ -13,3 +13,5 @@
 {"headline":"一句话概括本批最值得关注的产品现象","batch_summary":[{"text":"本批产品构成或重点产品的具体概览","evidence_ids":["产品ID"]}],"customer_patterns":[{"name":"客户群或共同任务","customers":"具体客户","shared_need":"共同需要完成的任务","products_comparison":"不同产品分别怎么服务他们","implication":"由此得到的产品判断，明确推断","evidence_ids":["至少1个产品ID"]}],"product_patterns":[{"name":"产品形态或设计模式","observation":"具体观察","examples":"代表产品以及各自做法","what_is_different":"真正有区分度的部分或同质化问题","evidence_ids":["产品ID"]}],"derived_thoughts":[{"title":"衍生思考标题","starting_point":"来自哪些产品事实或组合","target_customer":"可能相关的客户","product_direction":"可以怎样组合、扩展、垂直化或重新定位","reasoning":"为什么这个方向值得思考，而非简单复制","caveat":"反证、边界或它可能不成立的原因","evidence_ids":["产品ID"]}],"watch_signals":[{"text":"后续值得观察的具体产品、客户或商业信号","evidence_ids":["产品ID"]}],"limitations":["资料和推断边界"]}
 
 batch_summary 建议 3—6 条，customer_patterns 3—5 条，product_patterns 3—5 条，derived_thoughts 3—6 条。引用只能使用输入中的产品 ID。
+
+面向读者写作：正文里不要出现 screened、deep_dives、history、coverage、evidence_ids、产品 ID 等内部字段名或编号，用产品名称指代产品。样本局限（首次观察、非全市场、未核实）统一写在 limitations 里，headline 和 batch_summary 不要逐条重复“这是样本观察，不是趋势”之类的声明；只有某句结论特别容易被误读为市场事实时才在该句标注。

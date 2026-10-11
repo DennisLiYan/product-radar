@@ -5,5 +5,5 @@ logs/
 reports/
 latest.md
 analysis-status.json
-scheduler/*.plist
+scheduler/
 .DS_Store

@@ -8,7 +8,10 @@
   "http_timeout_seconds": 25,
   "http_attempts": 3,
   "request_interval_seconds": 0.4,
+  "source_start_interval_seconds": 2,
   "max_requests_per_source": 200,
+  "proxy_enabled": true,
+  "proxy_url": "http://127.0.0.1:1087",
   "report": {
     "daily_feature_count": 4,
     "daily_insight_count": 2,
@@ -34,7 +37,21 @@
     "history_days": 7,
     "fetch_product_pages": true,
     "page_timeout_seconds": 18,
-    "evidence_max_chars": 12000
+    "evidence_max_chars": 12000,
+    "preview_pages": true,
+    "preview_below_chars": 200,
+    "preview_max_chars": 600,
+    "preview_timeout_seconds": 8,
+    "preview_concurrency": 8,
+    "score_weights": {"specificity": 0.2, "positioning": 0.2, "customer": 0.2, "novelty": 0.2, "learnability": 0.2},
+    "select_pool_size": 60,
+    "min_per_category": 2,
+    "max_source_share": 0.4,
+    "max_category_share": 0.35,
+    "max_pick_share": 0.4,
+    "engagement_bonus": 10,
+    "cross_source_bonus": 8,
+    "feedback_examples": 20
   },
   "sources": [
     {
@@ -56,12 +73,22 @@
     },
     {
       "id": "yc_launches",
-      "name": "YC Launches / Launch HN",
-      "kind": "hn_search",
+      "name": "YC Launches",
+      "kind": "yc_launches",
       "enabled": true,
-      "url": "https://hn.algolia.com/api/v1/search_by_date",
-      "tags": "story",
-      "query": "Launch HN:"
+      "url": "https://www.ycombinator.com/launches?page={page}"
+    },
+    {
+      "id": "yc_companies",
+      "name": "YC 公司目录更新",
+      "kind": "sitemap",
+      "enabled": false,
+      "note": "sitemap 只有网址缩写，没有产品描述；实测 178 张卡片全部低置信度、平均关注度 20，停用以节省模型调用。",
+      "url": "https://www.ycombinator.com/companies/sitemap",
+      "accept": "*/*",
+      "path_pattern": "^/companies/[^/]+$",
+      "exclude_paths": ["/companies/sitemap"],
+      "max_items": 300
     },
     {
       "id": "product_hunt",
@@ -102,8 +129,79 @@
       "id": "reddit_startups",
       "name": "Reddit r/startups",
       "kind": "rss",
+      "enabled": false,
+      "url": "https://www.reddit.com/r/startups/new/.rss",
+      "note": "该社区的公开 feed 持续返回 429；已有 r/SideProject、r/SaaS、r/indiehackers 与 HN 创业讨论覆盖相邻信号。"
+    },
+    {
+      "id": "reddit_microsaas",
+      "name": "Reddit r/microsaas",
+      "kind": "rss",
       "enabled": true,
-      "url": "https://www.reddit.com/r/startups/new/.rss"
+      "url": "https://www.reddit.com/r/microsaas/new/.rss"
+    },
+    {
+      "id": "reddit_alphaandbetausers",
+      "name": "Reddit r/alphaandbetausers",
+      "kind": "rss",
+      "enabled": true,
+      "url": "https://www.reddit.com/r/alphaandbetausers/new/.rss"
+    },
+    {
+      "id": "hn_working_on",
+      "name": "HN 月度帖：What are you working on?",
+      "kind": "hn_thread",
+      "enabled": true,
+      "url": "https://hn.algolia.com/api/v1/search_by_date",
+      "author": "david927",
+      "thread_query": "What are you working on",
+      "title_pattern": "^Ask HN: What are you working on\\?",
+      "min_chars": 80,
+      "require_link": true
+    },
+    {
+      "id": "lobsters_show",
+      "name": "Lobsters Show",
+      "kind": "rss",
+      "enabled": false,
+      "url": "https://lobste.rs/t/show.rss",
+      "note": "当前网络连接 lobste.rs 超时；网络可达时可启用。"
+    },
+    {
+      "id": "hellogithub",
+      "name": "HelloGitHub 月刊",
+      "kind": "hellogithub",
+      "enabled": true,
+      "url": "https://hellogithub.com/rss"
+    },
+    {
+      "id": "hf_spaces",
+      "name": "Hugging Face Spaces 热门",
+      "kind": "hf_spaces",
+      "enabled": true,
+      "url": "https://huggingface.co/api/spaces?sort=trendingScore&limit=100&full=true",
+      "max_age_days": 30
+    },
+    {
+      "id": "sspai",
+      "name": "少数派",
+      "kind": "rss",
+      "enabled": true,
+      "url": "https://sspai.com/feed"
+    },
+    {
+      "id": "ruanyifeng_weekly",
+      "name": "阮一峰科技爱好者周刊",
+      "kind": "rss",
+      "enabled": true,
+      "url": "https://www.ruanyifeng.com/blog/atom.xml"
+    },
+    {
+      "id": "techcrunch_startups",
+      "name": "TechCrunch Startups",
+      "kind": "rss",
+      "enabled": true,
+      "url": "https://techcrunch.com/category/startups/feed/"
     },
     {
       "id": "appinn",
@@ -130,10 +228,9 @@
     {
       "id": "betalist",
       "name": "BetaList",
-      "kind": "unavailable",
-      "enabled": false,
-      "url": "https://betalist.com/",
-      "note": "未发现稳定公开 API/RSS；保留配置位，避免不可靠网页解析污染日报。"
+      "kind": "betalist",
+      "enabled": true,
+      "url": "https://betalist.com/?page={page}"
     },
     {
       "id": "uneed",

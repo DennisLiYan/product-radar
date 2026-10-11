@@ -7,6 +7,7 @@ import ipaddress
 import http.client
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -20,11 +21,18 @@ import urllib.request
 import uuid
 from zoneinfo import ZoneInfo
 
-from radar import ROOT, atomic_write, link, markdown, plain, stamp
+from radar import ROOT, atomic_write, effective_proxy, link, markdown, plain, stamp
 
 LOG = logging.getLogger("radar")
 PROMPTS = ROOT / "prompts"
 CATEGORIES = {"开发工具", "工作效率", "营销销售", "内容创作", "生活消费", "教育学习", "垂直行业", "基础设施", "其他"}
+SCORE_KEYS = ("specificity", "positioning", "customer", "novelty", "learnability")
+DEFAULT_WEIGHTS = {"specificity": 0.2, "positioning": 0.2, "customer": 0.2, "novelty": 0.2, "learnability": 0.2}
+# Hosts that list many unrelated products; their URLs cannot identify one product across sources.
+SHARED_HOSTS = {"news.ycombinator.com", "reddit.com", "old.reddit.com", "v2ex.com", "producthunt.com", "betalist.com",
+                "ycombinator.com", "sspai.com", "techcrunch.com", "appinn.com", "ruanyifeng.com", "hellogithub.com",
+                "lobste.rs", "twitter.com", "x.com", "youtube.com", "youtu.be", "medium.com", "apps.apple.com",
+                "play.google.com", "chromewebstore.google.com", "chrome.google.com", "linkedin.com", "substack.com"}
 
 
 def packed(value):
@@ -71,6 +79,9 @@ def init_db(db):
         status TEXT NOT NULL, report_json TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS page_evidence (
         url TEXT PRIMARY KEY, fetched_at INTEGER NOT NULL, data_json TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS feedback (
+        item_id TEXT PRIMARY KEY, name TEXT NOT NULL, verdict TEXT NOT NULL CHECK(verdict IN ('good','bad')),
+        note TEXT NOT NULL DEFAULT '', card_json TEXT NOT NULL, created_at INTEGER NOT NULL);
     """)
 
 
@@ -130,7 +141,10 @@ class LLMClient:
             raise ValueError("模型 API 地址不可包含凭据、参数或片段")
         if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost")):
             raise ValueError("远程模型 API 必须使用 HTTPS")
-        self.opener = urllib.request.build_opener(NoRedirect())
+        proxy = config.get("proxy_url")
+        handler = (urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+                   if proxy else urllib.request.ProxyHandler())
+        self.opener = urllib.request.build_opener(handler, NoRedirect())
         self.lock = threading.Lock()
         self.attempts = 0
 
@@ -145,7 +159,7 @@ class LLMClient:
                         elapsed, response_id, (error or "").replace(self.secret, "[REDACTED]")[:500], int(time.time())))
 
     def call(self, stage, payload, validator):
-        prompt = (PROMPTS / "common.txt").read_text() + "\n" + (PROMPTS / (stage + ".txt")).read_text()
+        prompt = (PROMPTS / "common.txt").read_text(encoding="utf-8") + "\n" + (PROMPTS / (stage + ".txt")).read_text(encoding="utf-8")
         deep = stage in ("deep", "product_audit", "synthesize", "audit")
         body = {"model": self.config["model"], "messages": [
             {"role": "system", "content": prompt},
@@ -165,6 +179,7 @@ class LLMClient:
             self.record(stage, "cached", 0)
             return data
         last_error = ""
+        attempt_body = body
         attempt_limit = max(self.config["max_attempts"], 3 if stage == "audit" else 1)
         for attempt in range(attempt_limit):
             with self.lock:
@@ -174,7 +189,7 @@ class LLMClient:
             start = time.monotonic()
             response, retryable = {}, True
             try:
-                request = urllib.request.Request(self.endpoint, data=packed(body).encode(), method="POST", headers={
+                request = urllib.request.Request(self.endpoint, data=packed(attempt_body).encode(), method="POST", headers={
                     "Content-Type": "application/json", "Authorization": "Bearer " + self.secret})
                 with self.opener.open(request, timeout=self.config["timeout_seconds"]) as handle:
                     response = json.loads(handle.read(16 * 1024 * 1024))
@@ -199,6 +214,12 @@ class LLMClient:
                 last_error = "模型 API 网络请求失败或超时"
             except (ValueError, KeyError, TypeError, IndexError) as error:
                 last_error = "模型输出校验失败：" + str(error)[:220]
+                content = ((response.get("choices") or [{}])[0].get("message") or {}).get("content")
+                if content:
+                    # Show the model its own output and the exact rule it broke, instead of resending blind.
+                    attempt_body = dict(body, messages=body["messages"] + [
+                        {"role": "assistant", "content": content},
+                        {"role": "user", "content": "上面的输出未通过程序校验：%s。请修正这一问题，重新输出完整 JSON。" % str(error)[:300]}])
             self.record(stage, "failed", time.monotonic() - start, response.get("usage"), response.get("id"), last_error)
             if not retryable or attempt + 1 == attempt_limit:
                 break
@@ -235,6 +256,91 @@ def validate_refs(obj, allowed, nonempty=True):
         raise ValueError("引用了不存在的证据 ID 或缺少证据")
 
 
+def product_score(scores, weights):
+    """0-100 from the 1-5 rubric; weights are configurable so the reader's taste can be tuned."""
+    total = sum(weights.get(k, 0) for k in SCORE_KEYS) or 1
+    return round(100 * sum(weights.get(k, 0) * (scores[k] - 1) / 4 for k in SCORE_KEYS) / total)
+
+
+def product_domain(url):
+    """A key that identifies one product across sources, or None for shared listing sites."""
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    host = host[4:] if host.startswith("www.") else host
+    path = [p.lower() for p in parts.path.split("/") if p]
+    if host in ("github.com", "gitlab.com"):
+        return host + "/" + "/".join(path[:2]) if len(path) >= 2 else None
+    if host == "huggingface.co":
+        return host + "/" + "/".join(path[:3]) if len(path) >= 3 else None
+    if not host or host in SHARED_HOSTS or any(host.endswith("." + h) for h in SHARED_HOSTS):
+        return None
+    return host
+
+
+def platform(row):
+    """Sources on one site (several HN searches, several subreddits) are not independent signals."""
+    host = (urllib.parse.urlsplit(row["discussion_url"]).hostname or row["source_id"]).lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def build_pool(records, by_id, cfg):
+    """Rank cards in code and keep a diverse pool, so the selector compares tens of cards, not a thousand."""
+    products = [r for r in records.values() if r["is_product"]]
+    points = {}
+    for card in products:
+        points.setdefault(by_id[card["id"]]["source_id"], []).append(by_id[card["id"]]["points"])
+    groups = {}
+    for card in products:
+        key = product_domain(by_id[card["id"]]["url"])
+        if key:
+            groups.setdefault(key, []).append(card)
+    ranked = []
+    for card in products:
+        row = by_id[card["id"]]
+        values = points[row["source_id"]]
+        percentile = sum(v < row["points"] for v in values) / len(values) if max(values) > 0 else 0
+        key = product_domain(row["url"])
+        members = groups.get(key, [card])
+        sources = sorted({by_id[c["id"]]["source_id"] for c in members})
+        platforms = {platform(by_id[c["id"]]) for c in members}
+        score = (card["product_score"] + cfg.get("engagement_bonus", 10) * percentile
+                 + cfg.get("cross_source_bonus", 8) * min(len(platforms) - 1, 2))
+        ranked.append(dict(card, rank_score=round(score, 1),
+                           signals={"source": row["source_id"], "source_percentile": round(percentile, 2),
+                                    "seen_in_sources": sources}, _key=key or card["id"]))
+    ranked.sort(key=lambda c: (-c["rank_score"], c["id"]))
+    best, seen = [], set()
+    for card in ranked:
+        if card["_key"] not in seen:
+            seen.add(card["_key"])
+            best.append(card)
+    size, quota = cfg.get("select_pool_size", 60), cfg.get("min_per_category", 2)
+    pool, counts = [], {}
+    for card in best:
+        if counts.get(card["category"], 0) < quota:
+            counts[card["category"]] = counts.get(card["category"], 0) + 1
+            pool.append(card)
+    # Soft caps keep one prolific source or category from crowding out the rest; they relax if the pool would stay short.
+    source_cap = max(1, int(size * cfg.get("max_source_share", 0.4)))
+    category_cap = max(1, int(size * cfg.get("max_category_share", 0.35)))
+    chosen = {card["id"] for card in pool}
+    for capped in (True, False):
+        for card in best:
+            if len(pool) >= size:
+                break
+            if card["id"] in chosen:
+                continue
+            if capped and (sum(c["signals"]["source"] == card["signals"]["source"] for c in pool) >= source_cap or
+                           sum(c["category"] == card["category"] for c in pool) >= category_cap):
+                continue
+            chosen.add(card["id"])
+            pool.append(card)
+    pool = sorted(pool[:size], key=lambda c: (-c["rank_score"], c["id"]))
+    for card in pool:
+        del card["_key"]
+    return pool
+
+
 def screen_validator(expected):
     def validate(data):
         rows = require_list(data, "items")
@@ -242,8 +348,10 @@ def screen_validator(expected):
         for row in rows:
             require_text(row, ["id", "name", "one_liner", "core_function", "positioning", "target_customers",
                                "use_case", "category", "product_stage", "why_interesting", "confidence"])
-            if type(row.get("product_score")) is not int or not 0 <= row["product_score"] <= 100:
-                raise ValueError("产品关注度须为 0—100 整数")
+            scores = row.get("scores")
+            if not isinstance(scores, dict) or any(type(scores.get(k)) is not int or not 1 <= scores[k] <= 5
+                                                   for k in SCORE_KEYS):
+                raise ValueError("scores 须包含 5 个 1—5 的整数维度")
             if row["category"] not in CATEGORIES or row["confidence"] not in ("高", "中", "低"):
                 raise ValueError("分类或置信度不在规定范围")
             if not isinstance(row.get("is_product"), bool):
@@ -251,7 +359,18 @@ def screen_validator(expected):
     return validate
 
 
-def selection_validator(allowed, count):
+def selection_caps(pool, count, share):
+    """Upper bounds per source and category, loosened when the pool lacks enough alternatives."""
+    caps = {}
+    for field in ("source", "category"):
+        values = [c["signals"]["source"] if field == "source" else c["category"] for c in pool]
+        for value in set(values):
+            others = sum(v != value for v in values)
+            caps[(field, value)] = max(math.ceil(count * share), count - others)
+    return caps
+
+
+def selection_validator(allowed, count, pool=None, caps=None):
     def validate(data):
         rows = require_list(data, "shortlist")
         if any(not isinstance(r, dict) for r in rows):
@@ -265,7 +384,37 @@ def selection_validator(allowed, count):
                 raise ValueError("缺少历史产品匹配说明")
             if not isinstance(row.get("is_material_update"), bool):
                 raise ValueError("is_material_update 必须为布尔值")
+        if caps and len(within_caps(rows, pool, caps)) < len(rows):
+            raise ValueError("超出 limits：同一来源或同一类别选得过多，请换成其他来源或类别的产品")
     return validate
+
+
+def refill(rows, count, pool, caps, recent_keys):
+    """Top up with the highest-ranked pool cards that fit the caps and were not featured recently."""
+    chosen = {row["id"] for row in rows}
+    for card in pool:
+        if len(rows) >= count:
+            break
+        if card["id"] in chosen or product_key(card["name"]) in recent_keys:
+            continue
+        candidate = rows + [{"id": card["id"], "why": "程序按排序补位，以满足来源与类别上限", "question": "",
+                             "previous_product": "", "is_material_update": False}]
+        if len(within_caps(candidate, pool, caps)) == len(candidate):
+            rows, chosen = candidate, chosen | {card["id"]}
+    return rows
+
+
+def within_caps(rows, pool, caps):
+    """Keep picks in order until a source or category reaches its cap."""
+    cards = {c["id"]: c for c in pool}
+    used, kept = {}, []
+    for row in rows:
+        keys = (("source", cards[row["id"]]["signals"]["source"]), ("category", cards[row["id"]]["category"]))
+        if all(used.get(key, 0) < caps[key] for key in keys):
+            for key in keys:
+                used[key] = used.get(key, 0) + 1
+            kept.append(row)
+    return kept
 
 
 def product_key(name):
@@ -346,22 +495,106 @@ def audit_validator(allowed):
     return validate
 
 
-def public_url(url):
+def public_url(url, proxied=False):
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in ("https", "http") or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("不是公开 HTTP(S) 地址")
     if parsed.port not in (None, 80, 443):
         raise ValueError("不抓取非标准端口")
-    addresses = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+    host = parsed.hostname.lower().rstrip(".")
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None and not literal.is_global:
+        raise ValueError("不抓取内网或本机地址")
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal", ".lan", ".home.arpa")):
+        raise ValueError("不抓取内网或本机地址")
+    if proxied and literal is None and not urllib.request.proxy_bypass(host):
+        # The proxy resolves the name; a local answer may be poisoned and is not what gets connected to.
+        return url
+    addresses = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
     if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
         raise ValueError("不抓取内网或本机地址")
     return url
 
 
 class PublicRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, proxied=False):
+        self.proxied = proxied
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        public_url(newurl)
+        public_url(newurl, self.proxied)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def page_meta(source):
+    """Title and description tags: the product's own one-line pitch, present even on script-heavy pages."""
+    title = re.search(r"<title[^>]*>(.*?)</title>", source, flags=re.IGNORECASE | re.DOTALL)
+    description = ""
+    for tag in re.findall(r"<meta\b[^>]*>", source, flags=re.IGNORECASE):
+        attrs = {k.lower(): v for k, _, v in re.findall(r'([\w:-]+)\s*=\s*(["\'])(.*?)\2', tag, flags=re.DOTALL)}
+        name = (attrs.get("name") or attrs.get("property") or "").lower()
+        if name in ("description", "og:description", "twitter:description") and attrs.get("content"):
+            description = plain(attrs["content"])[:300]
+            if name == "description":
+                break
+    return {"title": plain(title.group(1))[:300] if title else "", "description": description}
+
+
+def fetch_page(url, root, cfg, timeout=None):
+    """Fetch a public page once per day; product previews and deep-dive evidence share this cache."""
+    db_path = root / "data/radar.db"
+    with database(db_path) as db:
+        cached = db.execute("SELECT * FROM page_evidence WHERE url=?", (url,)).fetchone()
+    if cached and cached["fetched_at"] > int(time.time()) - 86400:
+        return json.loads(cached["data_json"])
+    try:
+        proxy = cfg.get("proxy_url")
+        public_url(url, bool(proxy))
+        request = urllib.request.Request(url, headers={"User-Agent": "ProductRadar/2.0 (personal research reader)"})
+        handler = (urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+                   if proxy else urllib.request.ProxyHandler())
+        with urllib.request.build_opener(handler, PublicRedirect(bool(proxy))).open(
+                request, timeout=timeout or cfg["page_timeout_seconds"]) as handle:
+            content_type = handle.headers.get("Content-Type", "")
+            if not any(t in content_type for t in ("text/html", "text/plain", "application/xhtml")):
+                raise ValueError("非文本网页")
+            body = handle.read(2 * 1024 * 1024)
+            charset = handle.headers.get_content_charset() or "utf-8"
+            source = body.decode(charset, errors="replace")
+            text = plain(source)[:cfg["evidence_max_chars"]]
+            meta = page_meta(source)
+            if len(text) < 100 and not meta["description"]:
+                raise ValueError("网页有效正文不足")
+            page = {"status": "ok", "url": handle.geturl(), "text": text, "meta": meta}
+    except Exception as error:
+        # Do not pass network stack details or response bodies to model prompts/logs.
+        code = error.code if isinstance(error, urllib.error.HTTPError) else type(error).__name__
+        page = {"status": "unavailable", "url": url, "reason": str(code)}
+    with database(db_path) as db, db:
+        db.execute("INSERT OR REPLACE INTO page_evidence VALUES(?,?,?)", (url, int(time.time()), packed(page)))
+    return page
+
+
+DISCUSSION_HOSTS = ("news.ycombinator.com", "reddit.com", "v2ex.com", "lobste.rs")
+
+
+def needs_preview(row, cfg):
+    host = (urllib.parse.urlsplit(row["url"]).hostname or "").lower()
+    return (cfg["fetch_product_pages"] and cfg.get("preview_pages", True)
+            and len(row["description"]) < cfg.get("preview_below_chars", 200)
+            and not any(host == h or host.endswith("." + h) for h in DISCUSSION_HOSTS))
+
+
+def page_preview(row, root, cfg):
+    """Short product-page excerpt for items whose source gives little more than a title."""
+    page = fetch_page(row["url"], root, cfg, cfg.get("preview_timeout_seconds", 8))
+    if page["status"] != "ok":
+        return ""
+    meta = page.get("meta") or {}
+    parts = [meta.get("title", ""), meta.get("description", ""), page["text"]]
+    return " | ".join(x for x in parts if x)[:cfg.get("preview_max_chars", 600)]
 
 
 def enrich(row, root, cfg):
@@ -371,31 +604,7 @@ def enrich(row, root, cfg):
     result = {"id": identity, "evidence": [base], "page_status": "未抓取"}
     if not cfg["fetch_product_pages"]:
         return result
-    db_path = root / "data/radar.db"
-    with database(db_path) as db:
-        cached = db.execute("SELECT * FROM page_evidence WHERE url=?", (row["url"],)).fetchone()
-    if cached and cached["fetched_at"] > int(time.time()) - 86400:
-        page = json.loads(cached["data_json"])
-    else:
-        try:
-            public_url(row["url"])
-            request = urllib.request.Request(row["url"], headers={"User-Agent": "ProductRadar/2.0 (personal research reader)"})
-            with urllib.request.build_opener(PublicRedirect()).open(request, timeout=cfg["page_timeout_seconds"]) as handle:
-                content_type = handle.headers.get("Content-Type", "")
-                if not any(t in content_type for t in ("text/html", "text/plain", "application/xhtml")):
-                    raise ValueError("非文本网页")
-                body = handle.read(2 * 1024 * 1024)
-                charset = handle.headers.get_content_charset() or "utf-8"
-                text = plain(body.decode(charset, errors="replace"))[:cfg["evidence_max_chars"]]
-                if len(text) < 100:
-                    raise ValueError("网页有效正文不足")
-                page = {"status": "ok", "url": handle.geturl(), "text": text}
-        except Exception as error:
-            # Do not pass network stack details or response bodies to model prompts/logs.
-            code = error.code if isinstance(error, urllib.error.HTTPError) else type(error).__name__
-            page = {"status": "unavailable", "url": row["url"], "reason": str(code)}
-        with database(db_path) as db, db:
-            db.execute("INSERT OR REPLACE INTO page_evidence VALUES(?,?,?)", (row["url"], int(time.time()), packed(page)))
+    page = fetch_page(row["url"], root, cfg)
     result["page_status"] = page["status"]
     if page["status"] == "ok":
         result["evidence"].append({"id": identity + ":page", "url": page["url"],
@@ -403,6 +612,93 @@ def enrich(row, root, cfg):
     else:
         result["page_note"] = "产品页无法读取；仅据发布来源分析，不能推测已核实官网信息。"
     return result
+
+
+def reader_feedback(db, limit):
+    """Recent reader verdicts, given to the selector as taste examples rather than hard filters."""
+    rows = db.execute("SELECT * FROM feedback ORDER BY created_at DESC LIMIT ?", (limit,))
+    examples = []
+    for row in rows:
+        card = json.loads(row["card_json"])
+        examples.append({"verdict": row["verdict"], "note": row["note"], "name": row["name"],
+                         "one_liner": card.get("one_liner", ""), "category": card.get("category", ""),
+                         "positioning": card.get("positioning", "")})
+    return examples
+
+
+def find_products(db, query):
+    """Match reported products by ID or name, newest report first."""
+    needle = product_key(query)
+    matches = {}
+    for (report_json,) in db.execute("SELECT report_json FROM analysis_reports ORDER BY day DESC"):
+        report = json.loads(report_json)
+        cards = {c["id"]: c for c in report.get("screened", [])}
+        for product in report.get("deep_dives", []) + list(cards.values()):
+            identity = product["id"]
+            if identity in matches:
+                continue
+            if query == identity or (needle and needle in product_key(product.get("name", ""))):
+                matches[identity] = dict(cards.get(identity, {}), **{"id": identity, "name": product["name"],
+                                                                    "day": report.get("day", "")})
+    return list(matches.values())
+
+
+def record_feedback(db, query, verdict, note=""):
+    init_db(db)
+    matches = find_products(db, query)
+    exact = [m for m in matches if m["id"] == query or product_key(m["name"]) == product_key(query)]
+    matches = exact or matches
+    if len(matches) != 1:
+        return matches
+    card = matches[0]
+    with db:
+        db.execute("INSERT OR REPLACE INTO feedback VALUES(?,?,?,?,?,?)",
+                   (card["id"], card["name"], verdict, note, packed(card), int(time.time())))
+    return matches
+
+
+def source_stats(db, config, since):
+    """Per-source yield: how much each source contributes to the pool, the shortlist and the daily brief."""
+    init_db(db)
+    feature_count = config["report"]["daily_feature_count"]
+    stats = {}
+
+    def bucket(source_id):
+        return stats.setdefault(source_id, {"items": 0, "cards": 0, "products": 0, "low_confidence": 0,
+                                            "score_total": 0, "pool": 0, "shortlist": 0, "featured": 0, "good": 0, "bad": 0})
+
+    for source_id, count in db.execute("SELECT source_id,COUNT(*) FROM items WHERE first_seen_at>=? GROUP BY source_id", (since,)):
+        bucket(source_id)["items"] = count
+    source_of = {}
+    for row in db.execute("SELECT item_id,source_id,data_json FROM screenings WHERE updated_at>=?", (since,)):
+        card = json.loads(row["data_json"])
+        source_of[row["item_id"]] = row["source_id"]
+        entry = bucket(row["source_id"])
+        entry["cards"] += 1
+        entry["products"] += bool(card.get("is_product"))
+        entry["low_confidence"] += card.get("confidence") == "低"
+        entry["score_total"] += card.get("product_score", 0)
+    for (report_json,) in db.execute("SELECT report_json FROM analysis_reports WHERE cutoff_at>=?", (since,)):
+        report = json.loads(report_json)
+        for field, ids in (("pool", report.get("pool", [])), ("shortlist", [p["id"] for p in report.get("shortlist", [])]),
+                           ("featured", [p["id"] for p in report.get("deep_dives", [])[:feature_count]])):
+            for identity in ids:
+                if identity in source_of:
+                    bucket(source_of[identity])[field] += 1
+    for row in db.execute("SELECT item_id,verdict FROM feedback WHERE created_at>=?", (since,)):
+        if row["item_id"] in source_of:
+            bucket(source_of[row["item_id"]])[row["verdict"]] += 1
+    names = {s["id"]: s["name"] for s in config["sources"]}
+    result = []
+    for source_id, entry in stats.items():
+        cards = entry.pop("score_total"), entry["cards"]
+        entry.update(source=source_id, name=names.get(source_id, source_id),
+                     avg_score=round(cards[0] / cards[1]) if cards[1] else None,
+                     product_rate=round(entry["products"] / cards[1], 2) if cards[1] else None,
+                     low_confidence_rate=round(entry["low_confidence"] / cards[1], 2) if cards[1] else None,
+                     shortlist_rate=round(entry["shortlist"] / entry["products"], 3) if entry["products"] else None)
+        result.append(entry)
+    return sorted(result, key=lambda e: (-(e["shortlist"]), -(e["avg_score"] or 0)))
 
 
 def usage_for(db, run_id):
@@ -415,7 +711,9 @@ def usage_for(db, run_id):
 
 def analyze_daily(root, config, cutoff, db):
     init_db(db)
-    cfg = config["llm"]
+    cfg = dict(config["llm"])
+    cfg["proxy_url"] = effective_proxy(config)
+    active_source_ids = {s["id"] for s in config["sources"] if s.get("enabled", True)}
     version = profile_hash(config)
     screening_version = screen_profile_hash(config)
     day = dt.datetime.fromtimestamp(cutoff, ZoneInfo(config["timezone"])).strftime("%Y-%m-%d")
@@ -429,8 +727,16 @@ def analyze_daily(root, config, cutoff, db):
         client = LLMClient(root, cfg, run_id)
         prior = {r["item_id"]: dict(r) for r in db.execute("SELECT * FROM screenings")}
         all_rows = [dict(r) for r in db.execute("SELECT * FROM items WHERE first_seen_at<=? ORDER BY published_at,source_id,external_id", (cutoff,))]
-        candidates = [r for r in all_rows if r["first_seen_at"] >= midnight or
-                      not prior.get(item_id(r), {}).get("reported_at")]
+        candidates = [r for r in all_rows if r["source_id"] in active_source_ids and
+                      (r["first_seen_at"] >= midnight or not prior.get(item_id(r), {}).get("reported_at"))]
+        # Several searches on one site can return the same post; analyze it once, under the first configured source.
+        rank = {source["id"]: index for index, source in enumerate(config["sources"])}
+        keep = {}
+        for row in candidates:
+            current = keep.get(row["discussion_url"])
+            if current is None or rank[row["source_id"]] < rank[current["source_id"]]:
+                keep[row["discussion_url"]] = row
+        candidates = [row for row in candidates if keep[row["discussion_url"]] is row]
         records, fingerprints, pending = {}, {}, []
         for row in candidates:
             identity = item_id(row)
@@ -444,9 +750,17 @@ def analyze_daily(root, config, cutoff, db):
                 pending.append(source)
         work = pending[:cfg["max_items_per_run"]]
         remaining = len(pending) - len(work)
+        by_id = {item_id(r): r for r in candidates}
+        thin = [x for x in work if needs_preview(by_id[x["id"]], cfg)]
+        if thin:
+            LOG.info("为 %d 条缺少简介的条目读取产品首页摘要", len(thin))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.get("preview_concurrency", 8)) as pool:
+                for source, preview in zip(thin, pool.map(lambda x: page_preview(by_id[x["id"]], root, cfg), thin)):
+                    if preview:
+                        source["page_preview"] = preview
         batches = [work[i:i + cfg["batch_size"]] for i in range(0, len(work), cfg["batch_size"])]
         LOG.info("开始模型全量归纳：待处理 %d，已缓存 %d，批次 %d", len(work), len(records), len(batches))
-        by_id = {item_id(r): r for r in candidates}
+        previewed = {x["id"] for x in work if x.get("page_preview")}
         errors = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=cfg["concurrency"]) as pool:
             futures = {pool.submit(client.call, "screen", {"focus": cfg["focus"], "items": batch},
@@ -458,8 +772,9 @@ def analyze_daily(root, config, cutoff, db):
                         for card in output:
                             identity = card["id"]
                             row = by_id[identity]
-                            if not row["description"]:
+                            if not row["description"] and identity not in previewed:
                                 card["confidence"] = "低"
+                            card["product_score"] = product_score(card["scores"], cfg.get("score_weights", DEFAULT_WEIGHTS))
                             records[identity] = card
                             db.execute("""INSERT INTO screenings VALUES(?,?,?,?,?,?,NULL)
                                        ON CONFLICT(item_id) DO UPDATE SET input_hash=excluded.input_hash,
@@ -476,19 +791,28 @@ def analyze_daily(root, config, cutoff, db):
             report = {"headline": "本次没有待分析的新内容", "batch_summary": [], "customer_patterns": [],
                       "product_patterns": [], "derived_thoughts": [], "watch_signals": [],
                       "limitations": ["没有新增样本，不能据此推断市场没有变化。"]}
-            shortlist, deep_dives, enriched, history = [], [], [], []
+            shortlist, deep_dives, enriched, history, select_pool = [], [], [], [], []
         else:
             repeat_days = config["report"]["repeat_suppression_days"]
             recent_reports = [json.loads(r[0]) for r in db.execute(
                 "SELECT report_json FROM analysis_reports WHERE day<? AND cutoff_at>=? ORDER BY day DESC",
                 (day, cutoff - repeat_days * 86400))]
             seen_products = recent_featured(recent_reports)
+            select_pool = build_pool(records, by_id, cfg)
+            LOG.info("程序排序后保留 %d 张候选卡片（共 %d 条产品）", len(select_pool), sum(r["is_product"] for r in screened))
+            caps = selection_caps(select_pool, cfg["deep_dive_count"], cfg.get("max_pick_share", 0.4))
+            limits = {"%s:%s" % key: value for key, value in caps.items() if value < cfg["deep_dive_count"]}
             shortlist = client.call("select", {"focus": cfg["focus"], "count": cfg["deep_dive_count"],
-                                    "items": screened, "recent_featured": seen_products},
-                                    selection_validator([r["id"] for r in screened if r["is_product"]], cfg["deep_dive_count"]))["shortlist"]
+                                    "items": select_pool, "recent_featured": seen_products, "limits": limits,
+                                    "reader_feedback": reader_feedback(db, cfg.get("feedback_examples", 20))},
+                                    selection_validator([r["id"] for r in select_pool], cfg["deep_dive_count"]))["shortlist"]
             recent_keys = {product_key(p["name"]) for p in seen_products if product_key(p["name"])}
             shortlist = [p for p in shortlist if p["is_material_update"] or
                          product_key(records[p["id"]]["name"]) not in recent_keys]
+            capped = within_caps(shortlist, select_pool, caps)
+            if len(capped) < len(shortlist):
+                LOG.warning("精选超出来源/类别上限，程序去掉 %d 个超额产品并按排序补位", len(shortlist) - len(capped))
+                shortlist = refill(capped, len(shortlist), select_pool, caps, recent_keys)
             LOG.info("模型选择 %d 个重点产品，开始补充公开页面证据", len(shortlist))
             with concurrent.futures.ThreadPoolExecutor(max_workers=cfg["concurrency"]) as pool:
                 enriched = list(pool.map(lambda p: enrich(by_id[p["id"]], root, cfg), shortlist))
@@ -529,15 +853,21 @@ def analyze_daily(root, config, cutoff, db):
                                    "customer_patterns": previous.get("customer_patterns", previous.get("themes", [])),
                                    "product_patterns": previous.get("product_patterns", []),
                                    "sample_size": len(h["screened"])})
-            coverage = {"current_sample": len(screened), "pending": remaining,
-                        "source_status": [dict(r) for r in db.execute("SELECT id,last_status FROM sources")],
+            category_counts = {}
+            for card in screened:
+                if card["is_product"]:
+                    category_counts[card["category"]] = category_counts.get(card["category"], 0) + 1
+            coverage = {"current_sample": len(screened), "pending": remaining, "category_counts": category_counts,
+                        "candidate_pool": "screened 为程序排序后的前 %d 张候选卡片，非全部样本" % len(select_pool),
+                        "source_status": [dict(r) for r in db.execute("SELECT id,last_status FROM sources")
+                                          if r["id"] in active_source_ids],
                         "gap_count": db.execute("SELECT COUNT(*) FROM coverage_gaps").fetchone()[0],
                         "historical_days": len(history), "note": "按首次发现时间归入日报，可能包括多天补抓；样本来自已配置平台，非全市场。"}
             LOG.info("开始跨产品综合归纳：%d 条样本，%d 份深读，%d 天历史", len(screened), len(deep_dives), len(history))
-            draft = client.call("synthesize", {"focus": cfg["focus"], "screened": screened, "deep_dives": deep_dives,
+            draft = client.call("synthesize", {"focus": cfg["focus"], "screened": select_pool, "deep_dives": deep_dives,
                                               "history": historical, "coverage": coverage}, synthesis_validator(records))
             LOG.info("开始模型事实与措辞复核")
-            reviewed = client.call("audit", {"focus": cfg["focus"], "synthesis": draft, "screened": screened,
+            reviewed = client.call("audit", {"focus": cfg["focus"], "synthesis": draft, "screened": select_pool,
                                              "deep_dives": deep_dives, "coverage": coverage}, audit_validator(records))
             report = reviewed["synthesis"]
             quality_notes = reviewed["quality_notes"]
@@ -546,11 +876,12 @@ def analyze_daily(root, config, cutoff, db):
         result = {"day": day, "cutoff_at": cutoff, "model": cfg["model"], "focus": cfg["focus"],
                   "timezone": config["timezone"], "artifact_root": str(root),
                   "source_names": {s["id"]: s["name"] for s in config["sources"]},
-                  "run_id": run_id, "screened": screened, "shortlist": shortlist, "deep_dives": deep_dives,
+                  "run_id": run_id, "screened": screened, "pool": [p["id"] for p in select_pool], "shortlist": shortlist, "deep_dives": deep_dives,
                   "evidence": enriched, "synthesis": report, "pending": remaining,
                   "quality_notes": quality_notes,
                   "history_days": len(history), "usage": usage_for(db, run_id),
-                  "collection_status": [dict(r) for r in db.execute("SELECT id,cursor_at,last_status FROM sources")],
+                  "collection_status": [dict(r) for r in db.execute("SELECT id,cursor_at,last_status FROM sources")
+                                        if r["id"] in active_source_ids],
                   "sources": {identity: {"title": r["title"], "url": r["url"], "discussion_url": r["discussion_url"],
                                           "source": r["source_id"], "published_at": r["published_at"]}
                               for identity, r in by_id.items() if identity in records}}
@@ -602,6 +933,10 @@ def render_daily(result, config):
         boundary = max(excerpt.rfind(mark) for mark in "。；！？")
         if boundary >= int(limit * 0.6):
             return excerpt[:boundary + 1]
+        # Prefer ending at a clause rather than mid-phrase.
+        clause = max(excerpt.rfind(mark) for mark in "，、：")
+        if clause >= int(limit * 0.6):
+            return excerpt[:clause] + "…"
         return excerpt[:limit - 1].rstrip() + "…"
 
     def source_link(identity):
@@ -632,19 +967,20 @@ def render_daily(result, config):
                 lines.append("- **衍生思考**：%s——%s" %
                              (markdown(cut(thought["title"], 45)), markdown(cut(thought["analysis"], 190))))
             lines.extend(["- **继续关注的理由**：" + markdown(cut(product["watch_reason"], 150)),
-                          "- **入口**：" + source_link(product["id"]), ""])
+                          "- **入口**：%s · 反馈 ID：`%s`" % (source_link(product["id"]), product["id"]), ""])
         if s["derived_thoughts"] and insight_count:
             lines.extend(["## 跨产品衍生思考", ""])
             for row in s["derived_thoughts"][:insight_count]:
-                lines.extend(["- **%s**：%s；边界：%s" %
-                              (markdown(cut(row["title"], 60)), markdown(cut(row["product_direction"], 160)),
+                lines.extend(["- **%s**：%s 边界：%s" %
+                              (markdown(cut(row["title"], 60)), markdown(cut(row["product_direction"], 160).rstrip("。；… ") + "。"),
                                markdown(cut(row["caveat"], 120)))])
             lines.append("")
         day_dir = Path(result.get("artifact_root", ROOT)) / "reports" / result["day"]
         lines.extend(["## 展开阅读", "",
                       "[%d 份完整产品档案](<%s>) · [全部产品卡片](<%s>) · [采集记录](<%s>)" %
                       (len(result["deep_dives"]), day_dir / "products.md", day_dir / "catalog.md", day_dir / "collection.md"), "",
-                      "样本来自已配置来源，客户与衍生判断中未被来源明确支持的部分均属于模型推断。"])
+                      "样本来自已配置来源，客户与衍生判断中未被来源明确支持的部分均属于模型推断。", "",
+                      "觉得某个产品有用或没用：`python3 radar.py feedback <反馈 ID> good|bad --note \"原因\"`，之后的精选会参考。"])
         return "\n".join(lines) + "\n"
 
     product_count = min(report_cfg["daily_feature_count"], len(result["deep_dives"]))

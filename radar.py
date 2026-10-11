@@ -4,7 +4,6 @@ import argparse
 import contextlib
 import datetime as dt
 import email.utils
-import fcntl
 import html
 from html.parser import HTMLParser
 import json
@@ -23,11 +22,22 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
 
 ROOT = Path(__file__).resolve().parent
 UTC = dt.timezone.utc
 LOG = logging.getLogger("radar")
+
+
+def effective_proxy(config):
+    """Return the configured proxy only when its explicit switch is enabled."""
+    return config.get("proxy_url") if config.get("proxy_enabled", False) else None
 
 
 def stamp(value):
@@ -157,8 +167,12 @@ class HTTPClient:
         self.raw_dir = raw_dir
         self.sequence = 0
         self.previous_request = 0.0
+        proxy = effective_proxy(config)
+        handler = (urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+                   if proxy else urllib.request.ProxyHandler())
+        self.opener = urllib.request.build_opener(handler)
 
-    def get(self, url):
+    def get(self, url, accept=None):
         if self.sequence >= self.config["max_requests_per_source"]:
             raise RuntimeError("达到单次请求上限；检查点未推进，下次继续重试。可提高 max_requests_per_source")
         self.sequence += 1
@@ -170,8 +184,8 @@ class HTTPClient:
             try:
                 request = urllib.request.Request(url, headers={
                     "User-Agent": "ProductRadar/1.0 (personal RSS reader)",
-                    "Accept": "application/json, application/atom+xml, application/rss+xml, application/xml, */*"})
-                with urllib.request.urlopen(request, timeout=self.config["http_timeout_seconds"]) as response:
+                    "Accept": accept or "application/json, application/atom+xml, application/rss+xml, application/xml, */*"})
+                with self.opener.open(request, timeout=self.config["http_timeout_seconds"]) as response:
                     body = response.read(12 * 1024 * 1024 + 1)
                     if len(body) > 12 * 1024 * 1024:
                         raise ValueError("响应超过 12 MiB")
@@ -192,18 +206,35 @@ class HTTPClient:
         raise RuntimeError("无可用 HTTP 请求次数")
 
     def json(self, url):
-        return json.loads(self.get(url))
+        # Some endpoints use exact Accept matching and return HTML for a
+        # weighted list even though their default representation is JSON.
+        return json.loads(self.get(url, "*/*"))
 
 
-def collect_hn(source, start, end, client):
+def hn_story(identity, hit):
+    discussion = "https://news.ycombinator.com/item?id=" + identity
+    title = plain(hit.get("title") or "")
+    if not title:
+        raise ValueError("HN 条目缺少标题")
+    return Item(identity, title, canonical_url(hit.get("url") or discussion),
+                discussion, int(hit["created_at_i"]), plain(hit.get("story_text") or "")[:12000],
+                int(hit.get("points") or 0), int(hit.get("num_comments") or 0))
+
+
+def collect_hn(source, start, end, client, tags=None, to_item=hn_story, query_text=None):
     found = {}
+    tags = tags or source.get("tags", "show_hn")
+    query_text = source.get("query") if query_text is None else query_text
 
     def query(left, right, page):
-        arguments = {"tags": source.get("tags", "show_hn"), "hitsPerPage": 100,
-                     "numericFilters": "created_at_i>=%d,created_at_i<%d" % (left, right),
+        filters = ["created_at_i>=%d" % left, "created_at_i<%d" % right]
+        if source.get("min_points"):
+            filters.append("points>=%d" % int(source["min_points"]))
+        arguments = {"tags": tags, "hitsPerPage": 100,
+                     "numericFilters": ",".join(filters),
                      "page": page}
-        if source.get("query"):
-            arguments["query"] = source["query"]
+        if query_text:
+            arguments["query"] = query_text
         params = urllib.parse.urlencode(arguments)
         data = client.json(source["url"] + "?" + params)
         if not isinstance(data, dict) or not isinstance(data.get("hits"), list) or "nbHits" not in data:
@@ -219,7 +250,9 @@ def collect_hn(source, start, end, client):
         # The search API caps accessible results. Split time ranges instead of silently
         # stopping at page 10 when catching up after a long offline period.
         exhaustive = first.get("exhaustiveNbHits", first.get("exhaustive", {}).get("nbHits", True))
-        if count > 900 or count > capacity or not exhaustive:
+        # Full-text searches may mark even a tiny, single-page count as
+        # approximate. Splitting those down to one second does not improve it.
+        if count > 900 or count > capacity:
             if right - left <= 1:
                 raise RuntimeError("HN 同一秒结果超过 API 可回溯上限，检查点不推进")
             middle = (left + right) // 2
@@ -237,15 +270,11 @@ def collect_hn(source, start, end, client):
             published = int(hit["created_at_i"])
             if not left <= published < right:
                 raise ValueError("HN API 未遵守请求时间范围")
-            discussion = "https://news.ycombinator.com/item?id=" + identity
-            title = plain(hit.get("title") or "")
-            if not title:
-                raise ValueError("HN 条目缺少标题")
             if int(hit.get("points") or 0) < int(source.get("min_points", 0)):
                 continue
-            found[identity] = Item(identity, title, canonical_url(hit.get("url") or discussion),
-                                   discussion, published, plain(hit.get("story_text") or "")[:12000],
-                                   int(hit.get("points") or 0), int(hit.get("num_comments") or 0))
+            item = to_item(identity, hit)
+            if item:
+                found[identity] = item
 
     if start < end:
         window(start, end)
@@ -255,6 +284,110 @@ def collect_hn(source, start, end, client):
     if source.get("min_points"):
         detail += "，至少 %d 分" % source["min_points"]
     return Batch(list(found.values()), note="按时间区间分页补抓（%s）；范围仅覆盖 Algolia 已索引内容。" % detail)
+
+
+def hn_thread_comment(thread_ids, min_chars, require_link):
+    """Top-level replies in an "Ask HN: What are you working on?" thread, one product each."""
+    def to_item(identity, hit):
+        if str(hit.get("parent_id")) not in thread_ids:
+            return None
+        raw = hit.get("comment_text") or ""
+        text = plain(raw)
+        if len(text) < min_chars:
+            return None
+        discussion = "https://news.ycombinator.com/item?id=" + identity
+        url = discussion
+        for href in re.findall(r'href="([^"]+)"', raw):
+            try:
+                candidate = canonical_url(html.unescape(href))
+            except ValueError:
+                continue
+            if urllib.parse.urlsplit(candidate).netloc != "news.ycombinator.com":
+                url = candidate
+                break
+        if require_link and url == discussion:
+            return None
+        title = re.split(r"(?<=[.!?。！？])\s|\n", text, maxsplit=1)[0][:100].strip()
+        return Item(identity, title, url, discussion, int(hit["created_at_i"]), text[:12000])
+    return to_item
+
+
+def collect_hn_thread(source, start, end, client):
+    # Monthly threads keep receiving replies for weeks, so look for threads opened before the window.
+    lookback = start - int(source.get("thread_max_age_days", 45)) * 86400
+    params = urllib.parse.urlencode({"tags": "story,author_" + source["author"], "query": source["thread_query"],
+                                     "numericFilters": "created_at_i>=%d,created_at_i<%d" % (lookback, end),
+                                     "hitsPerPage": 50})
+    data = client.json(source["url"] + "?" + params)
+    if not isinstance(data, dict) or not isinstance(data.get("hits"), list):
+        raise ValueError("HN 搜索 API 返回结构异常")
+    pattern = re.compile(source["title_pattern"], re.IGNORECASE)
+    threads = {str(hit["objectID"]): plain(hit.get("title") or "") for hit in data["hits"]
+               if pattern.search(hit.get("title") or "")}
+    found = {}
+    to_item = hn_thread_comment(set(threads), int(source.get("min_chars", 80)), source.get("require_link", True))
+    for thread_id in threads:
+        batch = collect_hn(source, start, end, client, "comment,story_" + thread_id, to_item, "")
+        found.update((item.external_id, item) for item in batch.items)
+    note = "读取 %d 个月度帖子的一级回复（%s）；只保留至少 %d 字符%s的自述。" % (
+        len(threads), "、".join(threads.values()) or "本区间无匹配帖子", int(source.get("min_chars", 80)),
+        "且带产品链接" if source.get("require_link", True) else "")
+    return Batch(list(found.values()), note=note)
+
+
+def collect_hf_spaces(source, start, end, client):
+    if start >= end:
+        return Batch([], "limited", "Hugging Face Spaces 热门榜是当前快照；没有可请求的历史区间。")
+    data = client.json(source["url"])
+    if not isinstance(data, list):
+        raise ValueError("Hugging Face Spaces API 返回结构异常")
+    newest = end - int(source.get("max_age_days", 30)) * 86400
+    items = []
+    for space in data:
+        identity = str(space.get("id") or "")
+        if not identity or parse_time(space.get("createdAt")) < newest:
+            continue
+        card = space.get("cardData") if isinstance(space.get("cardData"), dict) else {}
+        url = canonical_url("https://huggingface.co/spaces/" + identity)
+        details = [plain(card.get("short_description") or "")]
+        if space.get("sdk"):
+            details.append("SDK：" + plain(space["sdk"]))
+        details.append("%d likes" % int(space.get("likes") or 0))
+        items.append(Item(identity.lower(), plain(card.get("title") or identity), url, url, end - 1,
+                          "；".join(x for x in details if x), int(space.get("likes") or 0), 0))
+    return Batch(items, "limited", "Hugging Face Spaces 热门榜快照，只保留 %d 天内创建的 Space；以 Space ID 去重。"
+                 % int(source.get("max_age_days", 30)))
+
+
+def parse_hellogithub_volume(body, issue_url, published_at):
+    text = body.decode("utf-8", errors="replace")
+    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', text, flags=re.DOTALL)
+    if not match:
+        raise ValueError("HelloGitHub 期刊页面缺少结构化数据，可能是页面结构变化")
+    volume = json.loads(match.group(1))["props"]["pageProps"]["volume"]
+    items = []
+    for category in volume.get("data") or []:
+        for project in category.get("items") or []:
+            name = project.get("full_name") or ""
+            if not name or not project.get("github_url"):
+                continue
+            details = [plain(project.get("description") or ""), "分类：" + plain(category.get("category_name") or ""),
+                       "%d stars" % int(project.get("stars") or 0)]
+            items.append(Item(name.lower(), name, canonical_url(project["github_url"]), issue_url, published_at,
+                              "；".join(x for x in details if x)[:12000]))
+    if not items:
+        raise ValueError("HelloGitHub 期刊页面未找到项目")
+    return items
+
+
+def collect_hellogithub(source, start, end, client):
+    # The feed lists whole monthly issues; each issue page embeds its projects as JSON.
+    issues = [x for x in parse_feed(client.get(source["url"])) if start <= x.published_at < end]
+    items = {}
+    for issue in issues:
+        for item in parse_hellogithub_volume(client.get(issue.url, "text/html"), issue.url, issue.published_at):
+            items[item.external_id] = item
+    return Batch(list(items.values()), note="读取 %d 期月刊并拆分为单个开源项目。" % len(issues))
 
 
 def parse_github_trending(body, published_at):
@@ -293,6 +426,147 @@ def collect_github_trending(source, start, end, client):
     items = parse_github_trending(client.get(source["url"]), end - 1)
     return Batch(items, "limited",
                  "GitHub Trending 是当前排行榜快照，不提供发布时间或历史分页；仓库以 owner/repo 去重。")
+
+
+def sitemap_time(value):
+    value = (value or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return int(dt.datetime.fromisoformat(value).replace(tzinfo=UTC).timestamp())
+    return parse_time(value)
+
+
+def parse_sitemap(body, source):
+    root = ET.fromstring(body)
+    namespace = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
+    if root.tag != namespace + "urlset":
+        raise ValueError("响应不是 sitemap urlset")
+    pattern = re.compile(source["path_pattern"])
+    excluded = set(source.get("exclude_paths", []))
+    items = []
+    skipped_without_date = 0
+    for entry in root.findall(namespace + "url"):
+        raw_url = entry.findtext(namespace + "loc") or ""
+        try:
+            url = canonical_url(raw_url)
+        except ValueError:
+            continue
+        path = urllib.parse.urlsplit(url).path
+        if path in excluded or not pattern.fullmatch(path):
+            continue
+        modified = entry.findtext(namespace + "lastmod")
+        if not modified:
+            skipped_without_date += 1
+            continue
+        slug = urllib.parse.unquote(path.rstrip("/").rsplit("/", 1)[-1])
+        title_slug = re.sub(r"^[A-Za-z0-9]{3}-", "", slug) if source.get("strip_code_prefix") else slug
+        title = " ".join(part for part in title_slug.replace("_", "-").split("-") if part).strip()
+        items.append(Item(url, title or slug, url, url, sitemap_time(modified)))
+    if not items:
+        raise ValueError("sitemap 中没有符合路径规则且带 lastmod 的条目")
+    return items, skipped_without_date
+
+
+def collect_sitemap(source, start, end, client):
+    items, skipped = parse_sitemap(client.get(source["url"], source.get("accept")), source)
+    selected = [item for item in items if start <= item.published_at < end]
+    maximum = int(source.get("max_items", 1000))
+    if len(selected) > maximum:
+        raise RuntimeError("sitemap 本次出现 %d 个更新，超过来源阈值 %d；可能是批量改写 lastmod，检查点不推进" %
+                           (len(selected), maximum))
+    note = ("公开 sitemap 按 lastmod 增量读取；时间代表页面更新日，不一定是产品首次发布日。"
+            "当前页面被移除后无法从快照恢复。")
+    if skipped:
+        note += " %d 个匹配条目缺少 lastmod，已跳过。" % skipped
+    return Batch(selected, "limited", note)
+
+
+def collect_yc_launches(source, start, end, client):
+    selected = {}
+    seen_pages = set()
+    page = 0
+    while True:
+        data = client.json(source["url"].format(page=page))
+        if not isinstance(data, dict) or not isinstance(data.get("hits"), list):
+            raise ValueError("YC Launches 返回结构异常")
+        hits = data["hits"]
+        if not hits:
+            return Batch(list(selected.values()), note="YC Launches JSON 分页已到历史末尾。")
+        signature = tuple(str(hit.get("id")) for hit in hits)
+        if signature in seen_pages:
+            raise ValueError("YC Launches 分页重复，无法确认覆盖范围，检查点不推进")
+        seen_pages.add(signature)
+        parsed = []
+        for hit in hits:
+            identity = str(hit.get("id") or "")
+            title = plain(hit.get("title") or "")
+            if not identity or not title:
+                raise ValueError("YC Launches 条目缺少 ID 或标题")
+            published = parse_time(hit.get("created_at"))
+            company = hit.get("company") if isinstance(hit.get("company"), dict) else {}
+            discussion = canonical_url(hit.get("search_path") or
+                                       ("https://www.ycombinator.com/launches/" + str(hit.get("slug") or "")))
+            product_url = canonical_url(company.get("url") or discussion)
+            details = [plain(hit.get("tagline") or "")]
+            tags = company.get("tags") if isinstance(company.get("tags"), list) else []
+            if tags:
+                details.append("标签：" + "、".join(plain(x) for x in tags if isinstance(x, str)))
+            if company.get("batch"):
+                details.append("YC 批次：" + plain(company["batch"]))
+            item = Item(identity, title, product_url, discussion, published, "；".join(x for x in details if x),
+                        int(hit.get("total_vote_count") or 0), 0)
+            parsed.append(item)
+            if start <= published < end:
+                selected[identity] = item
+        if min(item.published_at for item in parsed) <= start:
+            return Batch(list(selected.values()), note="YC Launches 公开 JSON 按 created_at 分页回溯到采集起点。")
+        page += 1
+        if page >= int(data.get("nbPages", page)):
+            raise RuntimeError("YC Launches 可访问分页未覆盖回溯起点，检查点不推进")
+
+
+def parse_betalist(body):
+    text = body.decode("utf-8", errors="replace")
+    marker = re.compile(r'data-duplicate-id="day_(\d+)"')
+    positions = list(marker.finditer(text))
+    items = []
+    for index, match in enumerate(positions):
+        segment = text[match.end():positions[index + 1].start() if index + 1 < len(positions) else len(text)]
+        url_match = re.search(r'href="(/startups/[^/"?#]+)"', segment, flags=re.IGNORECASE)
+        if not url_match:
+            continue
+        title_match = re.search(
+            r'<span\b[^>]*class="[^"]*\bfont-medium\b[^"]*\btext-gray-900\b[^"]*"[^>]*>(.*?)</span>',
+            segment, flags=re.IGNORECASE | re.DOTALL)
+        description_match = re.search(
+            r'<span\b[^>]*class="[^"]*\btext-base\b[^"]*\btext-gray-500\b[^"]*"[^>]*>(.*?)</span>',
+            segment, flags=re.IGNORECASE | re.DOTALL)
+        if not title_match:
+            continue
+        path = html.unescape(url_match.group(1))
+        url = canonical_url("https://betalist.com" + path)
+        items.append(Item(path.rsplit("/", 1)[-1].lower(), plain(title_match.group(1)), url, url,
+                          int(match.group(1)), plain(description_match.group(1)) if description_match else ""))
+    if not items:
+        raise ValueError("BetaList 页面未找到带日期的产品卡片，可能是页面结构变化")
+    return items
+
+
+def collect_betalist(source, start, end, client):
+    selected = {}
+    seen_pages = set()
+    page = 1
+    while True:
+        entries = parse_betalist(client.get(source["url"].format(page=page)))
+        signature = tuple(item.external_id for item in entries)
+        if signature in seen_pages:
+            raise ValueError("BetaList 分页重复，无法确认覆盖范围，检查点不推进")
+        seen_pages.add(signature)
+        for item in entries:
+            if start <= item.published_at < end:
+                selected[item.external_id] = item
+        if min(item.published_at for item in entries) <= start:
+            return Batch(list(selected.values()), note="BetaList 首页按发布日期逐页回溯到采集起点。")
+        page += 1
 
 
 def collect_feed(source, start, end, client, required_start):
@@ -377,6 +651,18 @@ def collect_source(db, source, cutoff, config, client, run_id):
             batch = collect_feed(source, start, cutoff, client, required_start)
         elif source["kind"] == "github_trending":
             batch = collect_github_trending(source, start, cutoff, client)
+        elif source["kind"] == "hn_thread":
+            batch = collect_hn_thread(source, start, cutoff, client)
+        elif source["kind"] == "hellogithub":
+            batch = collect_hellogithub(source, start, cutoff, client)
+        elif source["kind"] == "hf_spaces":
+            batch = collect_hf_spaces(source, start, cutoff, client)
+        elif source["kind"] == "sitemap":
+            batch = collect_sitemap(source, start, cutoff, client)
+        elif source["kind"] == "yc_launches":
+            batch = collect_yc_launches(source, start, cutoff, client)
+        elif source["kind"] == "betalist":
+            batch = collect_betalist(source, start, cutoff, client)
         else:
             raise ValueError("不支持的来源类型：" + source["kind"])
         added = 0
@@ -433,7 +719,7 @@ def render_report(db, config, cutoff):
     tz = ZoneInfo(config["timezone"])
     local_now = dt.datetime.fromtimestamp(cutoff, tz)
     midnight = int(local_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    names = {s["id"]: s["name"] for s in config["sources"]}
+    names = {s["id"]: s["name"] for s in config["sources"] if s.get("enabled", True)}
 
     def display(timestamp):
         return dt.datetime.fromtimestamp(timestamp, tz).strftime("%Y-%m-%d %H:%M:%S")
@@ -444,8 +730,9 @@ def render_report(db, config, cutoff):
     for row in sorted(rows, key=lambda r: (rank(r, config), r["published_at"]), reverse=True):
         unique.setdefault(row["url"], row)
     top = list(unique.values())[:config["top_n"]]
-    latest_runs = list(db.execute("""SELECT sr.* FROM source_runs sr JOIN
-                     (SELECT source_id,MAX(rowid) rid FROM source_runs GROUP BY source_id) x ON sr.rowid=x.rid"""))
+    latest_runs = [r for r in db.execute("""SELECT sr.* FROM source_runs sr JOIN
+                     (SELECT source_id,MAX(rowid) rid FROM source_runs GROUP BY source_id) x ON sr.rowid=x.rid""")
+                   if r["source_id"] in names]
     gaps = list(db.execute("SELECT * FROM coverage_gaps ORDER BY detected_at DESC"))
     lines = ["# 创业产品日报 · " + local_now.strftime("%Y-%m-%d"), "",
              "更新至：%s（%s）。本日首次发现 **%d** 条，按相同链接合并后 **%d** 条。" %
@@ -534,11 +821,15 @@ def run(root, config, if_due=False):
             db.execute("UPDATE runs SET status='interrupted' WHERE status='running'")
             db.execute("INSERT INTO runs(id,started_at,cutoff_at,status) VALUES(?,?,?,'running')", (identity, cutoff, cutoff))
         statuses = []
+        started_sources = 0
         for source in config["sources"]:
             if not source.get("enabled", True):
                 continue
+            if started_sources:
+                time.sleep(config.get("source_start_interval_seconds", 0))
             client = HTTPClient(config, root / "data/raw" / identity / source["id"])
             statuses.append(collect_source(db, source, cutoff, config, client, identity))
+            started_sources += 1
         local_date = dt.datetime.fromtimestamp(cutoff, ZoneInfo(config["timezone"])).strftime("%Y-%m-%d")
         report_path = root / "reports" / local_date / "daily.md"
         analysis_status = publish(root, config, cutoff, db)
@@ -554,14 +845,26 @@ def run(root, config, if_due=False):
 
 def read_config(path):
     config = json.loads(path.read_text(encoding="utf-8"))
-    ZoneInfo(config["timezone"])
+    try:
+        ZoneInfo(config["timezone"])
+    except ZoneInfoNotFoundError:
+        raise ValueError("找不到时区 %s；Windows 需先执行 pip install tzdata" % config["timezone"]) from None
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", config["daily_time"]):
         raise ValueError("daily_time 必须为 HH:MM")
     for field_name in ("initial_lookback_days", "http_timeout_seconds", "http_attempts", "max_requests_per_source", "top_n"):
         if config[field_name] <= 0:
             raise ValueError(field_name + " 必须大于 0")
-    if config["overlap_hours"] < 0 or config["request_interval_seconds"] < 0:
+    if (config["overlap_hours"] < 0 or config["request_interval_seconds"] < 0 or
+            config.get("source_start_interval_seconds", 0) < 0):
         raise ValueError("回溯时间和请求间隔不能为负数")
+    if type(config.get("proxy_enabled")) is not bool:
+        raise ValueError("proxy_enabled 必须是 true 或 false")
+    if config["proxy_enabled"] and not config.get("proxy_url"):
+        raise ValueError("启用代理时必须配置 proxy_url")
+    if config.get("proxy_url"):
+        proxy = urllib.parse.urlsplit(config["proxy_url"])
+        if proxy.scheme not in ("http", "https") or not proxy.hostname or proxy.path not in ("", "/"):
+            raise ValueError("proxy_url 必须是 HTTP(S) 代理地址，不能包含路径")
     identities = [s["id"] for s in config["sources"]]
     if len(identities) != len(set(identities)) or not all(re.fullmatch(r"[a-z0-9_]+", x) for x in identities):
         raise ValueError("来源 ID 必须唯一，且只包含小写字母、数字、下划线")
@@ -589,20 +892,78 @@ def read_config(path):
 @contextlib.contextmanager
 def process_lock(path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as handle:
+    with path.open("a+") as handle:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            if fcntl:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
             raise RuntimeError("另一个采集任务正在运行，本次跳过") from None
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if fcntl:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            else:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def print_stats(root, config, days):
+    from analysis import source_stats
+    import unicodedata
+
+    def pad(value, width, left=False):
+        value = str(value)
+        while sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in value) > width:
+            value = value[:-1]
+        space = " " * (width - sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in value))
+        return value + space if left else space + value
+
+    def rate(value):
+        return "-" if value is None else "%d%%" % round(value * 100)
+
+    with contextlib.closing(connect(root / "data/radar.db")) as db:
+        rows = source_stats(db, config, int(time.time()) - days * 86400)
+    print("最近 %d 天各来源产出（候选池 = 程序排序后交给模型精选；重点 = 深读；日报 = 短报展示）" % days)
+    widths = (28, 6, 6, 7, 7, 5, 7, 5, 5, 8)
+    header = ("来源", "条目", "卡片", "产品率", "低置信", "均分", "候选池", "重点", "日报", "好/差评")
+    print(" ".join(pad(h, w, i == 0) for i, (h, w) in enumerate(zip(header, widths))))
+    for r in rows:
+        values = (r["name"], r["items"], r["cards"], rate(r["product_rate"]), rate(r["low_confidence_rate"]),
+                  "-" if r["avg_score"] is None else r["avg_score"], r["pool"], r["shortlist"], r["featured"],
+                  "%d/%d" % (r["good"], r["bad"]))
+        print(" ".join(pad(v, w, i == 0) for i, (v, w) in enumerate(zip(values, widths))))
+    return 0
+
+
+def give_feedback(root, args):
+    if not args.target or not args.verdict:
+        raise SystemExit("用法：radar.py feedback <产品ID或产品名> good|bad [--note 原因]")
+    from analysis import record_feedback
+    with contextlib.closing(connect(root / "data/radar.db")) as db:
+        matches = record_feedback(db, args.target, args.verdict, args.note)
+    if len(matches) == 1:
+        print("已记录：%s → %s。之后的精选会参考你的反馈。" % (matches[0]["name"], args.verdict))
+        return 0
+    if not matches:
+        print("没有找到匹配的产品；可使用日报中的产品 ID。")
+        return 1
+    print("匹配到多个产品，请改用产品 ID：")
+    for m in matches[:20]:
+        print("  %s  %s  %s" % (m["id"], m.get("day", ""), m["name"]))
+    return 1
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("run", "analyze", "status"))
+    parser.add_argument("command", choices=("run", "analyze", "status", "stats", "feedback"))
+    parser.add_argument("target", nargs="?", help="feedback：产品 ID 或产品名")
+    parser.add_argument("verdict", nargs="?", choices=("good", "bad"), help="feedback：good 有用 / bad 没用")
+    parser.add_argument("--note", default="", help="feedback：补充原因，会作为偏好样例交给模型")
+    parser.add_argument("--days", type=int, default=30, help="stats：统计最近多少天")
     parser.add_argument("--root", type=Path, default=ROOT, help="独立数据目录，默认脚本所在目录")
     parser.add_argument("--config", type=Path, default=ROOT / "config.json")
     parser.add_argument("--if-due", action="store_true", help="当前定时周期已成功/部分成功执行时跳过")
@@ -613,12 +974,26 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         handlers=[logging.StreamHandler(), RotatingFileHandler(root / "logs/radar.log",
                                    maxBytes=2_000_000, backupCount=3, encoding="utf-8")])
+    if args.command == "stats":
+        return print_stats(root, config, args.days)
+    if args.command == "feedback":
+        return give_feedback(root, args)
     with process_lock(root / "data/run.lock"):
         if args.command == "status":
             with contextlib.closing(connect(root / "data/radar.db")) as db:
                 from analysis import init_db
                 init_db(db)
-                print(json.dumps({"sources": [dict(r) for r in db.execute("SELECT * FROM sources")],
+                definitions = {s["id"]: s for s in config["sources"]}
+                states = {r["id"]: dict(r) for r in db.execute("SELECT * FROM sources")}
+                source_status = []
+                for identity, definition in definitions.items():
+                    entry = states.get(identity, {"id": identity, "cursor_at": None, "initial_since": None,
+                                                   "last_attempt_at": None, "last_status": None, "last_error": None})
+                    entry.update(name=definition.get("name", identity),
+                                 enabled=definition.get("enabled", True),
+                                 note=definition.get("note", ""))
+                    source_status.append(entry)
+                print(json.dumps({"sources": source_status,
                                   "items": db.execute("SELECT COUNT(*) FROM items").fetchone()[0],
                                   "coverage_gaps": db.execute("SELECT COUNT(*) FROM coverage_gaps").fetchone()[0],
                                   "last_run": dict(db.execute("SELECT * FROM runs ORDER BY rowid DESC LIMIT 1").fetchone() or {}),
