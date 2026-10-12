@@ -1,6 +1,7 @@
 import contextlib
 import datetime as dt
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 from pathlib import Path
 import re
@@ -114,6 +115,20 @@ class CollectorTests(unittest.TestCase):
             server.callback = lambda p: (503, b"unavailable")
             self.assertEqual(self.collect(source, self.now + 2 * 86400), "failed")
             self.assertEqual(self.db.execute("SELECT cursor_at FROM sources").fetchone()[0], self.now + 86400)
+
+    def test_run_retries_failed_sources_after_a_pause(self):
+        responses = [(503, b"waking up"), (200, rss([("fresh", self.now - 10)]))]
+        with Server(lambda p: responses.pop(0) if len(responses) > 1 else responses[0]) as server:
+            source = {"id": "test", "name": "Test", "kind": "rss", "url": server.url}
+            self.config.update(sources=[source], retry_failed_after_seconds=0, llm={"enabled": False})
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(radar.run(self.root, self.config), 0)
+        db = radar.connect(self.root / "data/radar.db")
+        try:
+            self.assertEqual([tuple(r) for r in db.execute("SELECT source_id,status FROM source_runs")], [("test", "limited")])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM items").fetchone()[0], 1)
+        finally:
+            db.close()
 
     def test_bounded_feed_gap_persists_after_later_success(self):
         entries = [("one", self.now - 100), ("two", self.now - 10)]

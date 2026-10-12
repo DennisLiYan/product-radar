@@ -255,6 +255,26 @@ class AnalysisTests(unittest.TestCase):
         uniform = pool[:8]
         self.assertEqual(analysis.selection_caps(uniform, 4, 0.5)[("source", "show_hn")], 4)
 
+    def test_failing_screen_batch_is_split_so_good_items_survive(self):
+        calls = []
+
+        class Client:
+            def call(self, stage, payload, validator):
+                ids = [x["id"] for x in payload["items"]]
+                calls.append(ids)
+                if "bad" in ids:
+                    raise RuntimeError("模型输出校验失败")
+                data = {"items": [card(i) for i in ids]}
+                validator(data)
+                return data
+
+        errors = []
+        batch = [{"id": i} for i in ("a", "b", "bad", "c")]
+        cards = analysis.screen_split(Client(), "focus", batch, errors)
+        self.assertEqual([c["id"] for c in cards], ["a", "b", "c"])
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(calls[0], ["a", "b", "bad", "c"])
+
     def test_page_meta_reads_description_tags(self):
         page = ('<html><head><title>Acme &amp; Co</title>'
                 '<meta property="og:description" content="It\'s for invoices">'

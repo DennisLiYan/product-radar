@@ -9,6 +9,7 @@
   "http_attempts": 3,
   "request_interval_seconds": 0.4,
   "source_start_interval_seconds": 2,
+  "retry_failed_after_seconds": 90,
   "max_requests_per_source": 200,
   "proxy_enabled": true,
   "proxy_url": "http://127.0.0.1:1087",

@@ -683,7 +683,7 @@ def collect_source(db, source, cutoff, config, client, run_id):
             if batch.gap and batch.gap[0] < batch.gap[1]:
                 db.execute("INSERT OR IGNORE INTO coverage_gaps(source_id,since_at,until_at,detected_at,note) VALUES(?,?,?,?,?)",
                            (identity, batch.gap[0], batch.gap[1], cutoff, batch.note))
-            db.execute("INSERT INTO source_runs VALUES(?,?,?,?,?,?,?,?)",
+            db.execute("INSERT OR REPLACE INTO source_runs VALUES(?,?,?,?,?,?,?,?)",
                        (run_id, identity, start, cutoff, batch.status, len(batch.items), added, batch.note))
         LOG.info("%s: %s, fetched=%d, new=%d", source["name"], batch.status, len(batch.items), added)
         return batch.status
@@ -692,7 +692,7 @@ def collect_source(db, source, cutoff, config, client, run_id):
         with db:
             db.execute("UPDATE sources SET last_attempt_at=?,last_status='failed',last_error=? WHERE id=?",
                        (cutoff, message, identity))
-            db.execute("INSERT INTO source_runs VALUES(?,?,?,?,?,?,?,?)",
+            db.execute("INSERT OR REPLACE INTO source_runs VALUES(?,?,?,?,?,?,?,?)",
                        (run_id, identity, start, cutoff, "failed", 0, 0, message))
         LOG.error("%s: %s", source["name"], message)
         return "failed"
@@ -713,6 +713,26 @@ def rank(item, config):
     text = (item["title"] + " " + item["description"]).lower()
     relevance = sum(1 for word in config["preferred_keywords"] if word.lower() in text)
     return relevance * 2 + min(5, math.log1p(max(0, item["points"]))) + min(2, math.log1p(max(0, item["comments"])))
+
+
+def fallback_summary(db, item):
+    """For title-only items, reuse the model's one-liner or the product page description from analysis."""
+    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "screenings" in tables:
+        row = db.execute("SELECT data_json FROM screenings WHERE source_id=? AND external_id=?",
+                         (item["source_id"], item["external_id"])).fetchone()
+        if row:
+            text = json.loads(row[0]).get("one_liner", "")
+            if text:
+                return "模型摘要：" + markdown(text)
+    if "page_evidence" in tables:
+        row = db.execute("SELECT data_json FROM page_evidence WHERE url=?", (item["url"],)).fetchone()
+        if row:
+            meta = json.loads(row[0]).get("meta") or {}
+            text = meta.get("description", "")
+            if text:
+                return "产品页简介：" + markdown(text[:280])
+    return ""
 
 
 def render_report(db, config, cutoff):
@@ -762,10 +782,13 @@ def render_report(db, config, cutoff):
     for index, item in enumerate(top, 1):
         source_name = names.get(item["source_id"], item["source_id"])
         description = item["description"]
-        excerpt = description[:280] + ("…" if len(description) > 280 else "")
+        excerpt = markdown(description[:280] + ("…" if len(description) > 280 else ""))
+        if not excerpt:
+            fallback = fallback_summary(db, item)
+            excerpt = fallback or "来源未提供正文摘要，点击链接查看详情。"
         lines.extend(["", "### %d. %s" % (index, markdown(item["title"])), "",
                       "%s · 发布于 %s" % (markdown(source_name), display(item["published_at"])), "",
-                      markdown(excerpt) if excerpt else "来源未提供正文摘要，点击链接查看详情。", "",
+                      excerpt, "",
                       link("产品 / 原文", item["url"]) + " · " + link("来源讨论", item["discussion_url"])])
         if item["points"] or item["comments"]:
             lines.append("来源热度：%d 分 / %d 条评论（采集时）。" % (item["points"], item["comments"]))
@@ -795,7 +818,11 @@ def publish(root, config, cutoff, db):
     atomic_write(day_dir / "collection.md", collection)
     if config.get("llm", {}).get("enabled"):
         from analysis import analyze_daily
-        return analyze_daily(root, config, cutoff, db)
+        try:
+            return analyze_daily(root, config, cutoff, db)
+        finally:
+            # Re-render so title-only entries can show summaries produced during analysis.
+            atomic_write(day_dir / "collection.md", render_report(db, config, cutoff))
     atomic_write(day_dir / "daily.md", collection)
     atomic_write(root / "latest.md", collection)
     return "ok"
@@ -820,16 +847,24 @@ def run(root, config, if_due=False):
         with db:
             db.execute("UPDATE runs SET status='interrupted' WHERE status='running'")
             db.execute("INSERT INTO runs(id,started_at,cutoff_at,status) VALUES(?,?,?,'running')", (identity, cutoff, cutoff))
-        statuses = []
-        started_sources = 0
+        statuses = {}
         for source in config["sources"]:
             if not source.get("enabled", True):
                 continue
-            if started_sources:
+            if statuses:
                 time.sleep(config.get("source_start_interval_seconds", 0))
             client = HTTPClient(config, root / "data/raw" / identity / source["id"])
-            statuses.append(collect_source(db, source, cutoff, config, client, identity))
-            started_sources += 1
+            statuses[source["id"]] = collect_source(db, source, cutoff, config, client, identity)
+        failed = [s for s in config["sources"] if statuses.get(s["id"]) == "failed"]
+        retry_wait = config.get("retry_failed_after_seconds", -1)
+        if failed and retry_wait >= 0:
+            # A scheduled run often starts right after wake, before Wi-Fi or the proxy is back.
+            LOG.info("%d 个来源失败，%d 秒后重试一轮", len(failed), retry_wait)
+            time.sleep(retry_wait)
+            for source in failed:
+                client = HTTPClient(config, root / "data/raw" / identity / (source["id"] + "-retry"))
+                statuses[source["id"]] = collect_source(db, source, cutoff, config, client, identity)
+        statuses = list(statuses.values())
         local_date = dt.datetime.fromtimestamp(cutoff, ZoneInfo(config["timezone"])).strftime("%Y-%m-%d")
         report_path = root / "reports" / local_date / "daily.md"
         analysis_status = publish(root, config, cutoff, db)

@@ -341,6 +341,20 @@ def build_pool(records, by_id, cfg):
     return pool
 
 
+def screen_split(client, focus, batch, errors):
+    """Screen a batch; on failure retry its halves so one bad item cannot sink the rest."""
+    try:
+        return client.call("screen", {"focus": focus, "items": batch},
+                           screen_validator([r["id"] for r in batch]))["items"]
+    except Exception as error:
+        if len(batch) == 1 or "上限" in str(error):
+            errors.append(str(error))
+            return []
+        LOG.warning("归纳批次（%d 条）失败，拆半重试：%s", len(batch), str(error)[:120])
+        half = len(batch) // 2
+        return screen_split(client, focus, batch[:half], errors) + screen_split(client, focus, batch[half:], errors)
+
+
 def screen_validator(expected):
     def validate(data):
         rows = require_list(data, "items")
@@ -763,11 +777,10 @@ def analyze_daily(root, config, cutoff, db):
         previewed = {x["id"] for x in work if x.get("page_preview")}
         errors = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=cfg["concurrency"]) as pool:
-            futures = {pool.submit(client.call, "screen", {"focus": cfg["focus"], "items": batch},
-                                   screen_validator([r["id"] for r in batch])): batch for batch in batches}
+            futures = {pool.submit(screen_split, client, cfg["focus"], batch, errors): batch for batch in batches}
             for future in concurrent.futures.as_completed(futures):
                 try:
-                    output = future.result()["items"]
+                    output = future.result()
                     with db:
                         for card in output:
                             identity = card["id"]
@@ -783,8 +796,11 @@ def analyze_daily(root, config, cutoff, db):
                     LOG.info("已归纳 %d / %d 条", len(records), len(candidates))
                 except Exception as error:
                     errors.append(str(error))
-        if errors:
+        if errors and not records:
             raise RuntimeError("%d 批产品归纳未完成；已成功批次缓存保留。%s" % (len(errors), errors[0]))
+        if errors:
+            # Unscreened items keep no screening row, so the next run picks them up again.
+            LOG.warning("%d 组条目归纳失败，本次跳过、下次重试：%s", len(errors), errors[0])
         screened = sorted(records.values(), key=lambda r: (-r["product_score"], r["id"]))
         if not screened:
             # No fabricated observations on an empty day.
