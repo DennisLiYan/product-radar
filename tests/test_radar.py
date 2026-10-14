@@ -130,6 +130,22 @@ class CollectorTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_ranked_feed_records_positions_and_v2ex_api_keeps_reply_counts(self):
+        entries = [("first", self.now - 50), ("second", self.now - 40)]
+        with Server(lambda p: (200, rss(entries))) as server:
+            source = {"id": "top", "name": "Top", "kind": "rss", "ranked": True, "url": server.url}
+            self.assertEqual(self.collect(source, self.now), "limited")
+        ranks = dict(self.db.execute("SELECT external_id, rank FROM item_ranks").fetchall())
+        self.assertEqual(ranks, {"first": 1, "second": 2})
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM coverage_gaps").fetchone()[0], 0)
+        topics = [{"id": 7, "title": "我做了一个工具", "content": "介绍", "replies": 12, "created": self.now - 100},
+                  {"id": 6, "title": "旧帖", "content": "", "replies": 3, "created": self.now - 10 * 86400}]
+        with Server(lambda p: (200, json.dumps(topics).encode())) as server:
+            source = {"id": "v2", "name": "V2", "kind": "v2ex_api", "url": server.url}
+            self.assertEqual(self.collect(source, self.now), "limited")
+        row = self.db.execute("SELECT * FROM items WHERE source_id='v2'").fetchone()
+        self.assertEqual((row["external_id"], row["comments"], row["url"]), ("v2ex:7", 12, "https://www.v2ex.com/t/7"))
+
     def test_bounded_feed_gap_persists_after_later_success(self):
         entries = [("one", self.now - 100), ("two", self.now - 10)]
         with Server(lambda p: (200, rss(entries))) as server:

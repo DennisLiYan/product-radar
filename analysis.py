@@ -19,6 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
 
 from radar import ROOT, atomic_write, effective_proxy, link, markdown, plain, stamp
@@ -26,8 +27,15 @@ from radar import ROOT, atomic_write, effective_proxy, link, markdown, plain, st
 LOG = logging.getLogger("radar")
 PROMPTS = ROOT / "prompts"
 CATEGORIES = {"开发工具", "工作效率", "营销销售", "内容创作", "生活消费", "教育学习", "垂直行业", "基础设施", "其他"}
-SCORE_KEYS = ("specificity", "positioning", "customer", "novelty", "learnability")
-DEFAULT_WEIGHTS = {"specificity": 0.2, "positioning": 0.2, "customer": 0.2, "novelty": 0.2, "learnability": 0.2}
+SCORE_KEYS = ("specificity", "positioning", "customer", "novelty", "learnability", "traction")
+DEFAULT_WEIGHTS = {"specificity": 0.15, "positioning": 0.1, "customer": 0.15, "novelty": 0.2, "learnability": 0.15,
+                   "traction": 0.25}
+# Fixed vocabulary so the same theme is counted the same way across days.
+THEMES = ("浏览器扩展", "移动App", "桌面应用", "命令行工具", "Web SaaS", "API/SDK", "开源项目", "自托管", "硬件",
+          "一次买断", "订阅制", "免费", "开源增值", "AI Agent", "AI编程辅助", "LLM应用", "MCP/工具集成", "端侧AI",
+          "本地优先/隐私", "自动化工作流", "监控与提醒", "内容生成", "垂直行业工具", "个人生产力", "开发者效率",
+          "团队协作", "中文用户")
+COMMENT_TYPES = ("质疑", "认可", "竞品对比", "使用反馈", "付费意愿", "作者回应")
 # Hosts that list many unrelated products; their URLs cannot identify one product across sources.
 SHARED_HOSTS = {"news.ycombinator.com", "reddit.com", "old.reddit.com", "v2ex.com", "producthunt.com", "betalist.com",
                 "ycombinator.com", "sspai.com", "techcrunch.com", "appinn.com", "ruanyifeng.com", "hellogithub.com",
@@ -180,7 +188,7 @@ class LLMClient:
             return data
         last_error = ""
         attempt_body = body
-        attempt_limit = max(self.config["max_attempts"], 3 if stage == "audit" else 1)
+        attempt_limit = max(self.config["max_attempts"], 3 if deep else 1)
         for attempt in range(attempt_limit):
             with self.lock:
                 if self.attempts >= self.config["max_calls_per_run"]:
@@ -189,10 +197,16 @@ class LLMClient:
             start = time.monotonic()
             response, retryable = {}, True
             try:
-                request = urllib.request.Request(self.endpoint, data=packed(attempt_body).encode(), method="POST", headers={
+                # Stream so tokens keep flowing during long thinking; proxies drop connections idle for ~60s.
+                # The cache key above is computed without these transport fields.
+                sent = dict(attempt_body, stream=True, stream_options={"include_usage": True})
+                request = urllib.request.Request(self.endpoint, data=packed(sent).encode(), method="POST", headers={
                     "Content-Type": "application/json", "Authorization": "Bearer " + self.secret})
                 with self.opener.open(request, timeout=self.config["timeout_seconds"]) as handle:
-                    response = json.loads(handle.read(16 * 1024 * 1024))
+                    if "text/event-stream" in handle.headers.get("Content-Type", ""):
+                        response = read_stream(handle)
+                    else:
+                        response = json.loads(handle.read(16 * 1024 * 1024))
                 choice = response["choices"][0]
                 if choice.get("finish_reason") != "stop":
                     raise ValueError("模型未完整完成输出（%s）" % choice.get("finish_reason"))
@@ -228,6 +242,29 @@ class LLMClient:
         raise RuntimeError(last_error)
 
 
+def read_stream(handle, limit=16 * 1024 * 1024):
+    """Assemble an OpenAI-style SSE stream into the non-streaming response shape; reasoning deltas are dropped."""
+    content, finish, usage, identity, model, size = [], None, None, None, None, 0
+    for raw in handle:
+        size += len(raw)
+        if size > limit:
+            raise ValueError("模型响应超过 16 MiB")
+        line = raw.strip()
+        if not line.startswith(b"data:"):
+            continue  # keep-alive comments and blank separators
+        data = line[5:].strip()
+        if data == b"[DONE]":
+            break
+        chunk = json.loads(data)
+        identity, model = chunk.get("id", identity), chunk.get("model", model)
+        usage = chunk.get("usage") or usage
+        for choice in chunk.get("choices") or []:
+            content.append((choice.get("delta") or {}).get("content") or "")
+            finish = choice.get("finish_reason") or finish
+    return {"id": identity, "model": model, "usage": usage,
+            "choices": [{"finish_reason": finish, "message": {"content": "".join(content)}}]}
+
+
 def require_text(obj, keys):
     if not isinstance(obj, dict):
         raise ValueError("应返回 JSON 对象")
@@ -258,8 +295,9 @@ def validate_refs(obj, allowed, nonempty=True):
 
 def product_score(scores, weights):
     """0-100 from the 1-5 rubric; weights are configurable so the reader's taste can be tuned."""
-    total = sum(weights.get(k, 0) for k in SCORE_KEYS) or 1
-    return round(100 * sum(weights.get(k, 0) * (scores[k] - 1) / 4 for k in SCORE_KEYS) / total)
+    keys = [k for k in SCORE_KEYS if k in scores]  # cards from before a dimension was added
+    total = sum(weights.get(k, 0) for k in keys) or 1
+    return round(100 * sum(weights.get(k, 0) * (scores[k] - 1) / 4 for k in keys) / total)
 
 
 def product_domain(url):
@@ -283,12 +321,51 @@ def platform(row):
     return host[4:] if host.startswith("www.") else host
 
 
+# Engagement that counts as "very high" on each platform: (points, comments). Ranked lists use their position instead.
+HEAT_SCALE = {"news.ycombinator.com": (150, 80), "github.com": (800, 0), "v2ex.com": (0, 40),
+              "ycombinator.com": (50, 0), "huggingface.co": (300, 0)}
+LANES = ("validated", "hot", "interesting", "other")
+LANE_NAMES = {"validated": "已获市场验证", "hot": "当前热门", "interesting": "功能有意思", "other": "其他"}
+
+
+def heat(row, cfg):
+    """0-1 popularity on the item's own platform, comparable across platforms."""
+    scale = dict(HEAT_SCALE, **{k: tuple(v) for k, v in cfg.get("heat_scale", {}).items()})
+    points, comments = scale.get(platform(row), (0, 0))
+    values = [min(1, row["points"] / points) if points else 0, min(1, row["comments"] / comments) if comments else 0]
+    if row.get("rank"):
+        values.append(max(0, 1 - (row["rank"] - 1) / cfg.get("rank_depth", 25)))
+    return round(max(values), 2)
+
+
+def lane(card, hot):
+    scores = card["scores"]
+    if scores.get("traction", 0) >= 4:  # concrete users, revenue or retention, not just a popular post
+        return "validated"
+    if hot >= 0.5:
+        return "hot"
+    if scores["novelty"] >= 4 and scores["positioning"] >= 4 and scores["specificity"] >= 3:
+        return "interesting"
+    return "other"
+
+
+def signal_text(row, source_name):
+    """Observable popularity facts, written by code so the model cannot inflate them."""
+    parts = []
+    if row.get("rank"):
+        parts.append("%s 榜单第 %d 位" % (source_name, row["rank"]))
+    if platform(row) == "github.com" and row["points"]:
+        parts.append("今日新增 %d stars" % row["points"])
+    elif row["points"]:
+        parts.append("%d 分" % row["points"])
+    if row["comments"]:
+        parts.append("%d 条评论" % row["comments"])
+    return "，".join(parts) or "来源未提供热度数据"
+
+
 def build_pool(records, by_id, cfg):
     """Rank cards in code and keep a diverse pool, so the selector compares tens of cards, not a thousand."""
     products = [r for r in records.values() if r["is_product"]]
-    points = {}
-    for card in products:
-        points.setdefault(by_id[card["id"]]["source_id"], []).append(by_id[card["id"]]["points"])
     groups = {}
     for card in products:
         key = product_domain(by_id[card["id"]]["url"])
@@ -297,16 +374,17 @@ def build_pool(records, by_id, cfg):
     ranked = []
     for card in products:
         row = by_id[card["id"]]
-        values = points[row["source_id"]]
-        percentile = sum(v < row["points"] for v in values) / len(values) if max(values) > 0 else 0
         key = product_domain(row["url"])
         members = groups.get(key, [card])
         sources = sorted({by_id[c["id"]]["source_id"] for c in members})
         platforms = {platform(by_id[c["id"]]) for c in members}
-        score = (card["product_score"] + cfg.get("engagement_bonus", 10) * percentile
+        hot = max(heat(by_id[c["id"]], cfg) for c in members)
+        kind = lane(card, hot)
+        bonus = cfg.get("lane_bonus", {"validated": 25, "hot": 15, "interesting": 8}).get(kind, 0)
+        score = (card["product_score"] + cfg.get("heat_bonus", 35) * hot + bonus
                  + cfg.get("cross_source_bonus", 8) * min(len(platforms) - 1, 2))
-        ranked.append(dict(card, rank_score=round(score, 1),
-                           signals={"source": row["source_id"], "source_percentile": round(percentile, 2),
+        ranked.append(dict(card, rank_score=round(score, 1), lane=kind,
+                           signals={"source": row["source_id"], "heat": hot, "popularity": row.get("signal", ""),
                                     "seen_in_sources": sources}, _key=key or card["id"]))
     ranked.sort(key=lambda c: (-c["rank_score"], c["id"]))
     best, seen = [], set()
@@ -341,10 +419,24 @@ def build_pool(records, by_id, cfg):
     return pool
 
 
+def featured_order(products, lanes, scores, sources, count, per_source):
+    """Order deep dives by the reader's priorities: validated, then hot, then interesting; spread the top slots across sources."""
+    ordered = sorted(products, key=lambda p: (LANES.index(lanes.get(p["id"], "other")), -scores.get(p["id"], 0)))
+    top, rest, used = [], [], {}
+    for product in ordered:
+        source = sources[product["id"]]
+        if len(top) < count and used.get(source, 0) < per_source:
+            used[source] = used.get(source, 0) + 1
+            top.append(product)
+        else:
+            rest.append(product)
+    return top + rest
+
+
 def screen_split(client, focus, batch, errors):
     """Screen a batch; on failure retry its halves so one bad item cannot sink the rest."""
     try:
-        return client.call("screen", {"focus": focus, "items": batch},
+        return client.call("screen", {"focus": focus, "theme_vocabulary": THEMES, "items": batch},
                            screen_validator([r["id"] for r in batch]))["items"]
     except Exception as error:
         if len(batch) == 1 or "上限" in str(error):
@@ -353,6 +445,29 @@ def screen_split(client, focus, batch, errors):
         LOG.warning("归纳批次（%d 条）失败，拆半重试：%s", len(batch), str(error)[:120])
         half = len(batch) // 2
         return screen_split(client, focus, batch[:half], errors) + screen_split(client, focus, batch[half:], errors)
+
+
+THEME_LOOKUP = {t.replace(" ", "").lower(): t for t in THEMES}
+
+
+def normalize_themes(themes):
+    """Keep only vocabulary tags; a near-miss label is dropped rather than failing the whole batch."""
+    found = [THEME_LOOKUP.get(t.replace(" ", "").lower()) for t in themes]
+    return list(dict.fromkeys(t for t in found if t))[:4]
+
+
+def call_split(client, stage, group, payload, validator, label):
+    """Run a grouped model call; on failure retry each product alone and return what succeeded."""
+    try:
+        return client.call(stage, payload(group), validator(group))["products"]
+    except Exception as error:
+        if "上限" in str(error):
+            raise
+        if len(group) == 1:
+            LOG.warning("%s 跳过 1 个产品：%s", label, str(error)[:160])
+            return []
+        LOG.warning("%s 一组 %d 个产品失败，改为逐个重试：%s", label, len(group), str(error)[:120])
+        return [p for item in group for p in call_split(client, stage, [item], payload, validator, label)]
 
 
 def screen_validator(expected):
@@ -365,7 +480,9 @@ def screen_validator(expected):
             scores = row.get("scores")
             if not isinstance(scores, dict) or any(type(scores.get(k)) is not int or not 1 <= scores[k] <= 5
                                                    for k in SCORE_KEYS):
-                raise ValueError("scores 须包含 5 个 1—5 的整数维度")
+                raise ValueError("scores 须包含 %d 个 1—5 的整数维度：%s" % (len(SCORE_KEYS), "、".join(SCORE_KEYS)))
+            if not isinstance(row.get("themes"), list) or any(not isinstance(t, str) for t in row["themes"]):
+                raise ValueError("themes 须为取自 theme_vocabulary 的标签数组")
             if row["category"] not in CATEGORIES or row["confidence"] not in ("高", "中", "低"):
                 raise ValueError("分类或置信度不在规定范围")
             if not isinstance(row.get("is_product"), bool):
@@ -401,6 +518,31 @@ def selection_validator(allowed, count, pool=None, caps=None):
         if caps and len(within_caps(rows, pool, caps)) < len(rows):
             raise ValueError("超出 limits：同一来源或同一类别选得过多，请换成其他来源或类别的产品")
     return validate
+
+
+def ensure_priority(rows, count, pool, recent_keys, share=0.5, min_heat=0.8):
+    """Guarantee the reader's top priorities a share of the shortlist even if the selector passed them over."""
+    lanes = {card["id"]: card["lane"] for card in pool}
+    required = [c for c in pool if (c["lane"] == "validated" or (c["lane"] == "hot" and c["signals"]["heat"] >= min_heat))
+                and product_key(c["name"]) not in recent_keys]
+    chosen = {row["id"] for row in rows}
+    have = sum(lanes.get(row["id"]) in ("validated", "hot") for row in rows)
+    for card in required:
+        if have >= max(1, int(count * share)):
+            break
+        if card["id"] in chosen:
+            continue
+        if len(rows) >= count:
+            # Drop the lowest-priority pick to make room.
+            drop = max(range(len(rows)), key=lambda i: (LANES.index(lanes.get(rows[i]["id"], "other")), i))
+            if LANES.index(lanes.get(rows[drop]["id"], "other")) <= LANES.index(card["lane"]):
+                break
+            rows = rows[:drop] + rows[drop + 1:]
+        rows = rows + [{"id": card["id"], "why": "程序按读者优先级补入（%s）" % LANE_NAMES[card["lane"]], "question": "",
+                        "previous_product": "", "is_material_update": False}]
+        chosen.add(card["id"])
+        have += 1
+    return rows
 
 
 def refill(rows, count, pool, caps, recent_keys):
@@ -445,6 +587,16 @@ def recent_featured(reports):
     return rows
 
 
+def recent_thoughts(reports, limit=60):
+    """Angles already written in recent briefs, so new thoughts can avoid repeating them."""
+    rows = []
+    for report in reports:
+        for product in report.get("deep_dives", []):
+            rows.extend(t.get("title", "") for t in product.get("derived_thoughts", []))
+        rows.extend(t.get("title", "") for t in (report.get("synthesis") or {}).get("derived_thoughts", []))
+    return [x for x in dict.fromkeys(rows) if x][:limit]
+
+
 def deep_validator(evidence_by_product):
     def validate(data):
         products = require_list(data, "products")
@@ -468,8 +620,20 @@ def deep_validator(evidence_by_product):
             if not thoughts:
                 raise ValueError("重点产品缺少衍生思考")
             for thought in thoughts:
-                require_text(thought, ["title", "analysis"])
+                require_text(thought, ["title", "analysis", "takeaway", "applies_when"])
                 validate_refs(thought, evidence_by_product[p["id"]])
+            reception = p.get("reception")
+            require_text(reception, ["signals", "why"])
+            validate_refs(reception, evidence_by_product[p["id"]], nonempty=False)
+            comment_ids = {x for x in evidence_by_product[p["id"]] if x.endswith(":comments")}
+            feedback = require_list(p, "community_feedback")
+            if feedback and not comment_ids:
+                raise ValueError("该产品没有社区评论证据，community_feedback 必须为空数组")
+            for row in feedback:
+                require_text(row, ["type", "text"])
+                if row["type"] not in COMMENT_TYPES:
+                    raise ValueError("community_feedback.type 只能为：" + "、".join(COMMENT_TYPES))
+                validate_refs(row, comment_ids)
             for key in ("risks", "unknowns"):
                 if any(not isinstance(x, str) for x in require_list(p, key)):
                     raise ValueError("风险与未知项应为文字")
@@ -611,13 +775,115 @@ def page_preview(row, root, cfg):
     return " | ".join(x for x in parts if x)[:cfg.get("preview_max_chars", 600)]
 
 
+def fetch_raw(url, cfg, timeout):
+    proxy = cfg.get("proxy_url")
+    public_url(url, bool(proxy))
+    request = urllib.request.Request(url, headers={"User-Agent": "ProductRadar/1.0 (personal RSS reader)"})
+    handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy}) if proxy else urllib.request.ProxyHandler()
+    for attempt in range(3):
+        try:
+            with urllib.request.build_opener(handler, PublicRedirect(bool(proxy))).open(request, timeout=timeout) as handle:
+                return handle.read(8 * 1024 * 1024)
+        except urllib.error.HTTPError as error:
+            if error.code != 429 or attempt == 2:
+                raise
+            time.sleep(cfg.get("comments_retry_seconds", 15))
+
+
+def fetch_json(url, cfg, timeout):
+    return json.loads(fetch_raw(url, cfg, timeout))
+
+
+def replies(node):
+    return sum(1 + replies(c) for c in node.get("children") or [])
+
+
+def parse_comments(discussion_url, cfg):
+    """Top-level community comments for a discussion page, most engaged first; authors are not kept."""
+    parts = urllib.parse.urlsplit(discussion_url)
+    host = (parts.hostname or "").lower()
+    timeout = cfg.get("comments_timeout_seconds", 15)
+    rows = []
+    if host == "news.ycombinator.com":
+        story = urllib.parse.parse_qs(parts.query).get("id", [""])[0]
+        if not story.isdigit():
+            return None
+        data = fetch_json("https://hn.algolia.com/api/v1/items/" + story, cfg, timeout)
+        for child in data.get("children") or []:
+            text = plain(child.get("text") or "")
+            if text:
+                rows.append({"text": text, "weight": replies(child), "by_author": child.get("author") == data.get("author")})
+    elif host == "reddit.com" or host.endswith(".reddit.com"):
+        if "/comments/" not in parts.path:
+            return None
+        # Reddit blocks anonymous JSON; the comment Atom feed lists the post first, then comments in top order.
+        feed = ET.fromstring(fetch_raw("https://www.reddit.com" + parts.path.rstrip("/") + "/.rss?sort=top&limit=60",
+                                       cfg, timeout))
+        entries = feed.findall("{http://www.w3.org/2005/Atom}entry")
+        name = "{http://www.w3.org/2005/Atom}author/{http://www.w3.org/2005/Atom}name"
+        op = entries[0].findtext(name) if entries else None
+        for position, entry in enumerate(entries[1:]):
+            text = plain(entry.findtext("{http://www.w3.org/2005/Atom}content") or "")
+            if text and text not in ("[deleted]", "[removed]"):
+                rows.append({"text": text, "weight": -position, "by_author": entry.findtext(name) == op})
+    elif host in ("v2ex.com", "www.v2ex.com"):
+        match = re.match(r"/t/(\d+)", parts.path)
+        if not match:
+            return None
+        for reply in fetch_json("https://www.v2ex.com/api/replies/show.json?topic_id=" + match.group(1), cfg, timeout):
+            text = " ".join((reply.get("content") or "").split())
+            if text:
+                rows.append({"text": text, "weight": 0, "by_author": False})
+    else:
+        return None
+    rows.sort(key=lambda r: -r["weight"])
+    return rows[:cfg.get("comments_max", 30)]
+
+
+def fetch_comments(discussion_url, root, cfg):
+    """Community comments with a one-day cache shared with page evidence; failures are cached briefly as empty."""
+    key = "comments:" + discussion_url
+    db_path = root / "data/radar.db"
+    with database(db_path) as db:
+        cached = db.execute("SELECT * FROM page_evidence WHERE url=?", (key,)).fetchone()
+    if cached and cached["fetched_at"] > int(time.time()) - 86400:
+        return json.loads(cached["data_json"])
+    try:
+        rows = parse_comments(discussion_url, cfg)
+        result = {"status": "ok" if rows is not None else "unsupported", "comments": rows or []}
+    except Exception as error:
+        code = error.code if isinstance(error, urllib.error.HTTPError) else type(error).__name__
+        return {"status": "unavailable", "reason": str(code), "comments": []}
+    with database(db_path) as db, db:
+        db.execute("INSERT OR REPLACE INTO page_evidence VALUES(?,?,?)", (key, int(time.time()), packed(result)))
+    return result
+
+
+def comment_evidence(identity, discussion_url, comments, limit):
+    lines, size = [], 0
+    for row in comments:
+        line = "- " + ("[作者回复] " if row["by_author"] else "") + row["text"][:600]
+        if size + len(line) > limit:
+            break
+        lines.append(line)
+        size += len(line)
+    return {"id": identity + ":comments", "url": discussion_url, "text": "\n".join(lines),
+            "kind": "社区评论：%d 条一级评论，按互动排序；代表个别用户观点，未核实" % len(lines)}
+
+
 def enrich(row, root, cfg):
     identity = item_id(row)
     base = {"id": identity + ":source", "url": row["discussion_url"],
             "text": row["title"] + "\n" + row["description"], "kind": "发布来源/发布者自述"}
-    result = {"id": identity, "evidence": [base], "page_status": "未抓取"}
+    result = {"id": identity, "evidence": [base], "page_status": "未抓取", "comment_count": 0}
     if not cfg["fetch_product_pages"]:
         return result
+    if cfg.get("fetch_comments", True):
+        comments = fetch_comments(row["discussion_url"], root, cfg)["comments"]
+        if comments:
+            evidence = comment_evidence(identity, row["discussion_url"], comments, cfg.get("comments_max_chars", 6000))
+            result["evidence"].append(evidence)
+            result["comment_count"] = evidence["text"].count("\n") + 1
     page = fetch_page(row["url"], root, cfg)
     result["page_status"] = page["status"]
     if page["status"] == "ok":
@@ -715,6 +981,41 @@ def source_stats(db, config, since):
     return sorted(result, key=lambda e: (-(e["shortlist"]), -(e["avg_score"] or 0)))
 
 
+def theme_trends(db, config, cutoff, window_days=14, recent_days=3, limit=15):
+    """Theme counts over recent days from stored cards, so patterns rest on numbers rather than one day's sample."""
+    tz = ZoneInfo(config["timezone"])
+    today = dt.datetime.fromtimestamp(cutoff, tz).date()
+    rows = db.execute("""SELECT s.data_json, i.first_seen_at FROM screenings s JOIN items i
+                         ON s.source_id=i.source_id AND s.external_id=i.external_id
+                         WHERE i.first_seen_at>? AND i.first_seen_at<=?""", (cutoff - window_days * 86400, cutoff))
+    tags, days, total, recent_total = {}, set(), 0, 0
+    for data_json, seen in rows:
+        card = json.loads(data_json)
+        if not card.get("is_product") or not card.get("themes"):
+            continue
+        day = dt.datetime.fromtimestamp(seen, tz).date()
+        recent = (today - day).days < recent_days
+        days.add(day)
+        total += 1
+        recent_total += recent
+        for tag in card["themes"]:
+            entry = tags.setdefault(tag, {"tag": tag, "count": 0, "recent": 0, "examples": []})
+            entry["count"] += 1
+            if recent:
+                entry["recent"] += 1
+                entry["examples"].append((card.get("product_score", 0), card["name"]))
+    result = []
+    for entry in sorted(tags.values(), key=lambda e: (-e["count"], e["tag"]))[:limit]:
+        earlier = entry["count"] - entry["recent"]
+        result.append({"tag": entry["tag"], "count": entry["count"], "share": round(entry["count"] / total, 3),
+                       "recent": entry["recent"],
+                       "recent_share": round(entry["recent"] / recent_total, 3) if recent_total else 0,
+                       "earlier_share": round(earlier / (total - recent_total), 3) if total > recent_total else None,
+                       "examples": [name for _, name in sorted(entry["examples"], reverse=True)[:3]]})
+    return {"window_days": window_days, "recent_days": recent_days, "days_with_data": len(days),
+            "products": total, "recent_products": recent_total, "tags": result}
+
+
 def usage_for(db, run_id):
     row = db.execute("""SELECT COUNT(*) total, SUM(status='cached') cached, SUM(status='ok') successful,
                      SUM(status='failed') failed, COALESCE(SUM(prompt_tokens),0) input_tokens,
@@ -751,11 +1052,18 @@ def analyze_daily(root, config, cutoff, db):
             if current is None or rank[row["source_id"]] < rank[current["source_id"]]:
                 keep[row["discussion_url"]] = row
         candidates = [row for row in candidates if keep[row["discussion_url"]] is row]
+        ranks = {(r["source_id"], r["external_id"]): r["rank"] for r in db.execute("SELECT * FROM item_ranks")}
+        source_names = {x["id"]: x["name"] for x in config["sources"]}
+        for row in candidates:
+            row["rank"] = ranks.get((row["source_id"], row["external_id"]), 0)
+            row["signal"] = signal_text(row, source_names.get(row["source_id"], row["source_id"]))
         records, fingerprints, pending = {}, {}, []
         for row in candidates:
             identity = item_id(row)
             source = {"id": identity, "source": row["source_id"], "title": row["title"],
                       "url": row["url"], "description": row["description"][:2400]}
+            if row["points"] or row["comments"] or row["rank"]:
+                source["engagement"] = row["signal"]
             fingerprints[identity] = digest({"profile": screening_version, "source": source})
             old = prior.get(identity)
             if old and old["input_hash"] == fingerprints[identity]:
@@ -787,6 +1095,7 @@ def analyze_daily(root, config, cutoff, db):
                             row = by_id[identity]
                             if not row["description"] and identity not in previewed:
                                 card["confidence"] = "低"
+                            card["themes"] = normalize_themes(card["themes"])
                             card["product_score"] = product_score(card["scores"], cfg.get("score_weights", DEFAULT_WEIGHTS))
                             records[identity] = card
                             db.execute("""INSERT INTO screenings VALUES(?,?,?,?,?,?,NULL)
@@ -808,6 +1117,7 @@ def analyze_daily(root, config, cutoff, db):
                       "product_patterns": [], "derived_thoughts": [], "watch_signals": [],
                       "limitations": ["没有新增样本，不能据此推断市场没有变化。"]}
             shortlist, deep_dives, enriched, history, select_pool = [], [], [], [], []
+            trends = theme_trends(db, config, cutoff, cfg.get("trend_window_days", 14))
         else:
             repeat_days = config["report"]["repeat_suppression_days"]
             recent_reports = [json.loads(r[0]) for r in db.execute(
@@ -829,36 +1139,60 @@ def analyze_daily(root, config, cutoff, db):
             if len(capped) < len(shortlist):
                 LOG.warning("精选超出来源/类别上限，程序去掉 %d 个超额产品并按排序补位", len(shortlist) - len(capped))
                 shortlist = refill(capped, len(shortlist), select_pool, caps, recent_keys)
-            LOG.info("模型选择 %d 个重点产品，开始补充公开页面证据", len(shortlist))
+            thought_history = recent_thoughts([json.loads(r[0]) for r in db.execute(
+                "SELECT report_json FROM analysis_reports WHERE day<? AND cutoff_at>=? ORDER BY day DESC",
+                (day, cutoff - cfg["history_days"] * 86400))])
+            prioritized = ensure_priority(shortlist, cfg["deep_dive_count"], select_pool, recent_keys,
+                                          cfg.get("priority_share", 0.5), cfg.get("priority_min_heat", 0.8))
+            if prioritized != shortlist:
+                LOG.info("按读者优先级补入 %d 个已验证/高热度产品", len({r["id"] for r in prioritized} - {r["id"] for r in shortlist}))
+                shortlist = prioritized
+            LOG.info("模型选择 %d 个重点产品，开始补充公开页面与社区评论证据", len(shortlist))
             with concurrent.futures.ThreadPoolExecutor(max_workers=cfg["concurrency"]) as pool:
                 enriched = list(pool.map(lambda p: enrich(by_id[p["id"]], root, cfg), shortlist))
+            pool_cards = {c["id"]: c for c in select_pool}
             for product in enriched:
                 product["screening"] = records[product["id"]]
+                card = pool_cards.get(product["id"], {})
+                product["market_signals"] = {"lane": LANE_NAMES[card.get("lane", "other")],
+                                             "popularity": by_id[product["id"]]["signal"],
+                                             "heat": card.get("signals", {}).get("heat", 0)}
             deep_dives = []
+            refs_of = {p["id"]: {e["id"] for e in p["evidence"]} for p in enriched}
             with concurrent.futures.ThreadPoolExecutor(max_workers=cfg["concurrency"]) as pool:
-                futures = []
-                for i in range(0, len(enriched), 2):
-                    group = enriched[i:i + 2]
-                    refs = {p["id"]: {e["id"] for e in p["evidence"]} for p in group}
-                    futures.append(pool.submit(client.call, "deep", {"focus": cfg["focus"], "products": group}, deep_validator(refs)))
+                futures = [pool.submit(call_split, client, "deep", enriched[i:i + 2],
+                                       lambda g: {"focus": cfg["focus"], "products": g, "recent_thoughts": thought_history},
+                                       lambda g: deep_validator({p["id"]: refs_of[p["id"]] for p in g}), "产品深读")
+                           for i in range(0, len(enriched), 2)]
                 for future in concurrent.futures.as_completed(futures):
-                    deep_dives.extend(future.result()["products"])
+                    deep_dives.extend(future.result())
+            if not deep_dives and enriched:
+                raise RuntimeError("全部重点产品深读失败")
             order = {p["id"]: i for i, p in enumerate(shortlist)}
             deep_dives.sort(key=lambda p: order[p["id"]])
             LOG.info("开始逐份复核重点产品档案")
             reviewed_products = []
             evidence_lookup = {p["id"]: p for p in enriched}
+            def audit_payload(group):
+                ids = {p["id"] for p in group}
+                return {"products": group, "evidence": [evidence_lookup[p["id"]] for p in group],
+                        "recent_thoughts": thought_history,
+                        "other_products_today": [t["title"] for p in deep_dives if p["id"] not in ids for t in p["derived_thoughts"]]}
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=cfg["concurrency"]) as pool:
-                futures = []
-                for i in range(0, len(deep_dives), 2):
-                    group = deep_dives[i:i + 2]
-                    refs = {p["id"]: {e["id"] for e in evidence_lookup[p["id"]]["evidence"]} for p in group}
-                    materials = [evidence_lookup[p["id"]] for p in group]
-                    futures.append(pool.submit(client.call, "product_audit",
-                                               {"products": group, "evidence": materials}, deep_validator(refs)))
+                futures = [pool.submit(call_split, client, "product_audit", deep_dives[i:i + 2], audit_payload,
+                                       lambda g: deep_validator({p["id"]: refs_of[p["id"]] for p in g}), "产品复核")
+                           for i in range(0, len(deep_dives), 2)]
                 for future in concurrent.futures.as_completed(futures):
-                    reviewed_products.extend(future.result()["products"])
-            deep_dives = sorted(reviewed_products, key=lambda p: order[p["id"]])
+                    reviewed_products.extend(future.result())
+            # A product whose review failed keeps its validated first draft rather than disappearing.
+            reviewed_ids = {p["id"] for p in reviewed_products}
+            reviewed_products.extend(p for p in deep_dives if p["id"] not in reviewed_ids)
+            deep_dives = featured_order(sorted(reviewed_products, key=lambda p: order[p["id"]]),
+                                        {c["id"]: c["lane"] for c in select_pool},
+                                        {c["id"]: c["rank_score"] for c in select_pool},
+                                        {i: platform(by_id[i]) for i in order},
+                                        config["report"]["daily_feature_count"], cfg.get("featured_per_source", 2))
             history = [json.loads(r[0]) for r in db.execute(
                 "SELECT report_json FROM analysis_reports WHERE day<? AND cutoff_at>=? ORDER BY day DESC LIMIT ?",
                 (day, cutoff - cfg["history_days"] * 86400, cfg["history_days"]))]
@@ -879,12 +1213,16 @@ def analyze_daily(root, config, cutoff, db):
                                           if r["id"] in active_source_ids],
                         "gap_count": db.execute("SELECT COUNT(*) FROM coverage_gaps").fetchone()[0],
                         "historical_days": len(history), "note": "按首次发现时间归入日报，可能包括多天补抓；样本来自已配置平台，非全市场。"}
+            trends = theme_trends(db, config, cutoff, cfg.get("trend_window_days", 14))
+            featured = [p["id"] for p in deep_dives[:config["report"]["daily_feature_count"]]]
             LOG.info("开始跨产品综合归纳：%d 条样本，%d 份深读，%d 天历史", len(screened), len(deep_dives), len(history))
             draft = client.call("synthesize", {"focus": cfg["focus"], "screened": select_pool, "deep_dives": deep_dives,
+                                              "featured": featured, "theme_trends": trends, "recent_thoughts": thought_history,
                                               "history": historical, "coverage": coverage}, synthesis_validator(records))
             LOG.info("开始模型事实与措辞复核")
             reviewed = client.call("audit", {"focus": cfg["focus"], "synthesis": draft, "screened": select_pool,
-                                             "deep_dives": deep_dives, "coverage": coverage}, audit_validator(records))
+                                             "deep_dives": deep_dives, "featured": featured, "theme_trends": trends,
+                                             "coverage": coverage}, audit_validator(records))
             report = reviewed["synthesis"]
             quality_notes = reviewed["quality_notes"]
         if not screened:
@@ -894,7 +1232,8 @@ def analyze_daily(root, config, cutoff, db):
                   "source_names": {s["id"]: s["name"] for s in config["sources"]},
                   "run_id": run_id, "screened": screened, "pool": [p["id"] for p in select_pool], "shortlist": shortlist, "deep_dives": deep_dives,
                   "evidence": enriched, "synthesis": report, "pending": remaining,
-                  "quality_notes": quality_notes,
+                  "quality_notes": quality_notes, "theme_trends": trends,
+                  "lanes": {c["id"]: c["lane"] for c in select_pool},
                   "history_days": len(history), "usage": usage_for(db, run_id),
                   "collection_status": [dict(r) for r in db.execute("SELECT id,cursor_at,last_status FROM sources")
                                         if r["id"] in active_source_ids],
@@ -936,6 +1275,29 @@ def analyze_daily(root, config, cutoff, db):
         return "failed"
 
 
+def trend_lines(trends, limit):
+    """Theme counts rendered in code: the numbers come straight from stored cards, not from the model."""
+    if not trends or not trends["tags"]:
+        return []
+    building = trends["days_with_data"] < 3
+    lines = ["## 主题走势", "",
+             "近 %d 天已配置来源中的产品主题出现次数（已积累 %d 天、%d 个产品%s）：" %
+             (trends["window_days"], trends["days_with_data"], trends["products"],
+              "；数据积累中，暂不比较升降" if building else "；箭头比较近 %d 天与此前占比" % trends["recent_days"]), ""]
+    parts = []
+    for tag in trends["tags"][:limit]:
+        arrow = ""
+        earlier, recent = tag.get("earlier_share"), tag["recent_share"]
+        if not building and earlier is not None and abs(recent - earlier) >= 0.02:
+            if recent >= earlier * 1.3:
+                arrow = " ↑"
+            elif recent <= earlier / 1.3:
+                arrow = " ↓"
+        parts.append("%s %d（%d%%）%s" % (markdown(tag["tag"]), tag["count"], round(tag["share"] * 100), arrow))
+    lines.extend([" · ".join(parts), ""])
+    return lines
+
+
 def render_daily(result, config):
     """Reader-facing brief. Full model output remains in the dated folder."""
     s, sources = result["synthesis"], result["sources"]
@@ -975,13 +1337,26 @@ def render_daily(result, config):
             features = cut(product["core_features"][0]["text"], 190)
             customers = "、".join(x["segment"] for x in product["customer_segments"][:3])
             thought = product["derived_thoughts"][0] if product["derived_thoughts"] else None
-            lines.extend(["### " + markdown(product["name"]), "", markdown(cut(product["one_liner"], 130)), "",
-                          "- **核心功能**：" + markdown(features),
+            kind = result.get("lanes", {}).get(product["id"], "other")
+            title = markdown(product["name"]) + (" · " + LANE_NAMES[kind] if kind != "other" else "")
+            lines.extend(["### " + title, "", markdown(cut(product["one_liner"], 130)), ""])
+            reception = product.get("reception")
+            if reception:
+                lines.append("- **市场反响**：" + markdown(cut(reception["signals"], 150)))
+                label = "为什么受欢迎" if kind in ("validated", "hot") else "产品逻辑"
+                lines.append("- **%s**：%s" % (label, markdown(cut(reception["why"], 200))))
+            lines.extend(["- **核心功能**：" + markdown(features),
                           "- **产品定位**：" + markdown(cut(product["positioning"], 170)),
                           "- **主要客户**：" + markdown(cut(customers, 170))])
+            feedback = product.get("community_feedback") or []
+            if feedback:
+                lines.append("- **社区反馈**：" + "；".join(
+                    "%s：%s" % (markdown(row["type"]), markdown(cut(row["text"], 110))) for row in feedback[:2]))
             if thought:
-                lines.append("- **衍生思考**：%s——%s" %
-                             (markdown(cut(thought["title"], 45)), markdown(cut(thought["analysis"], 190))))
+                body = thought.get("takeaway") or thought["analysis"]
+                lines.append("- **衍生思考**：%s——%s" % (markdown(cut(thought["title"], 45)), markdown(cut(body, 170))))
+                if thought.get("applies_when"):
+                    lines.append("  适用条件：" + markdown(cut(thought["applies_when"], 110)))
             lines.extend(["- **继续关注的理由**：" + markdown(cut(product["watch_reason"], 150)),
                           "- **入口**：%s · 反馈 ID：`%s`" % (source_link(product["id"]), product["id"]), ""])
         if s["derived_thoughts"] and insight_count:
@@ -991,6 +1366,7 @@ def render_daily(result, config):
                               (markdown(cut(row["title"], 60)), markdown(cut(row["product_direction"], 160).rstrip("。；… ") + "。"),
                                markdown(cut(row["caveat"], 120)))])
             lines.append("")
+        lines.extend(trend_lines(result.get("theme_trends"), 8))
         day_dir = Path(result.get("artifact_root", ROOT)) / "reports" / result["day"]
         lines.extend(["## 展开阅读", "",
                       "[%d 份完整产品档案](<%s>) · [全部产品卡片](<%s>) · [采集记录](<%s>)" %
@@ -1033,8 +1409,14 @@ def render_analysis(result):
     lines.extend(["", "## 本期重点产品", ""])
     evidence = {e["id"]: e for product in result["evidence"] for e in product["evidence"]}
     for p in result["deep_dives"]:
-        lines.extend(["### " + markdown(p["name"]), "", "**一句话定位**：" + markdown(p["one_liner"]), "",
-                      "**产品定位**：" + markdown(p["positioning"]), "", "#### 核心功能", ""])
+        kind = result.get("lanes", {}).get(p["id"], "other")
+        lines.extend(["### " + markdown(p["name"]) + (" · " + LANE_NAMES[kind] if kind != "other" else ""), "",
+                      "**一句话定位**：" + markdown(p["one_liner"]), "",
+                      "**产品定位**：" + markdown(p["positioning"]), ""])
+        if p.get("reception"):
+            lines.extend(["#### 市场反响", "", "**可观察的信号**：" + markdown(p["reception"]["signals"]), "",
+                          "**为什么会有这样的反响**：" + markdown(p["reception"]["why"]), ""])
+        lines.extend(["#### 核心功能", ""])
         for feature in p["core_features"]:
             citations = "、".join(link("来源", evidence[x]["url"]) for x in dict.fromkeys(feature["evidence_ids"]))
             lines.append("- " + markdown(feature["text"]) + "（" + citations + "）")
@@ -1050,10 +1432,19 @@ def render_analysis(result):
         lines.append("")
         for key, label in product_fields:
             lines.extend(["**%s**：%s" % (label, markdown(p[key])), ""])
+        if p.get("community_feedback"):
+            lines.extend(["#### 社区怎么说", "", "来自来源讨论区的一级评论，代表个别用户观点，未核实。", ""])
+            for row in p["community_feedback"]:
+                lines.append("- **%s**：%s" % (markdown(row["type"]), markdown(row["text"])))
+            lines.append("")
         lines.extend(["#### 衍生思考", ""])
         for thought in p["derived_thoughts"]:
             citations = "、".join(link("来源产品", evidence[x]["url"]) for x in dict.fromkeys(thought["evidence_ids"]))
             lines.append("- **%s**：%s（%s）" % (markdown(thought["title"]), markdown(thought["analysis"]), citations))
+            if thought.get("takeaway"):
+                lines.append("  - 可复用的做法：" + markdown(thought["takeaway"]))
+            if thought.get("applies_when"):
+                lines.append("  - 适用条件：" + markdown(thought["applies_when"]))
         lines.extend(["", "**为什么值得关注**：" + markdown(p["watch_reason"]), "",
                       "**风险**：" + "；".join(markdown(x) for x in p["risks"]), "",
                       "**仍需核实**：" + "；".join(markdown(x) for x in p["unknowns"]), "",
@@ -1080,6 +1471,8 @@ def render_analysis(result):
     lines.extend(["## 后续值得观察的信号", ""])
     for row in s["watch_signals"]:
         lines.extend(["- " + markdown(row["text"]), "  相关产品：" + refs(row["evidence_ids"])])
+    lines.append("")
+    lines.extend(trend_lines(result.get("theme_trends"), 15))
     lines.extend(["## 资料边界与运行记录", ""])
     for text in s["limitations"]:
         lines.append("- " + markdown(text))
@@ -1105,7 +1498,7 @@ def render_analysis(result):
     # Models occasionally repeat internal evidence IDs inside prose even though
     # citations are rendered separately. Keep those implementation IDs out of
     # the reader-facing report.
-    return re.sub(r"[（(]?p\\?_[0-9a-f]{16}:(?:source|page)(?:[、,，]\s*p\\?_[0-9a-f]{16}:(?:source|page))*[）)]?", "", rendered)
+    return re.sub(r"[（(]?p\\?_[0-9a-f]{16}:(?:source|page|comments)(?:[、,，]\s*p\\?_[0-9a-f]{16}:(?:source|page|comments))*[）)]?", "", rendered)
 
 
 def render_catalog(result):

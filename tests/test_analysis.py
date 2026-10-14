@@ -16,7 +16,8 @@ def card(identity):
             "core_function": "把零散任务归并成可检索的项目清单", "positioning": "轻量任务整理工具",
             "target_customers": "需要整理重复任务的小团队", "use_case": "每周汇总项目任务",
             "category": "工作效率", "product_stage": "已发布",
-            "scores": {"specificity": 4, "positioning": 4, "customer": 3, "novelty": 3, "learnability": 4},
+            "scores": {"specificity": 4, "positioning": 4, "customer": 3, "novelty": 3, "learnability": 4, "traction": 2},
+            "themes": ["Web SaaS", "团队协作"],
             "why_interesting": "工作流具体，但采用情况未知", "confidence": "低", "is_product": True}
 
 
@@ -73,7 +74,12 @@ class ModelFixture:
                                       core_features=[{"text": "发布者称可整理任务", "evidence_ids": [evidence_id]}],
                                       customer_segments=[{"segment": "小团队", "role": "使用者", "scenario": "整理任务",
                                                           "need": "减少遗漏", "basis": "模型推断", "evidence_ids": [evidence_id]}],
+                                      community_feedback=[],
+                                      reception={"signals": "来源未提供热度数据", "why": "工作流具体，属于推断",
+                                                 "evidence_ids": [evidence_id]},
                                       derived_thoughts=[{"title": "检索扩展", "analysis": "可扩展历史检索，属于推断",
+                                                         "takeaway": "把清单做成可检索的历史库",
+                                                         "applies_when": "任务重复度高的小团队",
                                                          "evidence_ids": [evidence_id]}],
                                       risks=["需求待验证"], unknowns=["价格未知"])
                         products.append(record)
@@ -161,7 +167,7 @@ class AnalysisTests(unittest.TestCase):
                 self.assertEqual(api.stages.count("select"), 1)
                 self.assertEqual(api.stages.count("deep"), 1)
                 self.assertEqual(api.stages.count("product_audit"), 1)
-                self.assertEqual(api.stages.count("synthesize"), 2)
+                self.assertEqual(api.stages.count("synthesize"), 4)  # 3 failed attempts, then success
                 self.assertEqual(api.stages.count("audit"), 1)
                 self.assertFalse(analysis.analysis_is_due(db, config, now - 1))
                 self.assertIn("每日产品短报", (root / "latest.md").read_text())
@@ -199,7 +205,7 @@ class AnalysisTests(unittest.TestCase):
 
     def test_pool_merges_cross_source_products_and_keeps_category_quota(self):
         def row(identity, source, url, points=0):
-            return {"source_id": source, "url": url, "points": points,
+            return {"source_id": source, "url": url, "points": points, "comments": 0,
                     "discussion_url": "https://%s.example/%s" % (source, identity)}
         cards, rows = {}, {}
         for i in range(30):
@@ -308,6 +314,126 @@ class AnalysisTests(unittest.TestCase):
                 stats = {r["source"]: r for r in analysis.source_stats(db, config, now - 60)}
                 self.assertEqual((stats["show_hn"]["pool"], stats["show_hn"]["shortlist"], stats["show_hn"]["featured"]), (1, 1, 1))
                 self.assertEqual((stats["show_hn"]["good"], stats["v2ex_create"]["bad"]), (1, 1))
+            finally:
+                db.close()
+
+    def test_heat_lanes_and_featured_order_follow_reader_priorities(self):
+        def row(url, points=0, comments=0, rank=0):
+            return {"discussion_url": url, "source_id": "s", "points": points, "comments": comments, "rank": rank}
+        self.assertEqual(analysis.heat(row("https://news.ycombinator.com/item?id=1", 300, 10), {}), 1)
+        self.assertEqual(analysis.heat(row("https://www.reddit.com/r/x/comments/1/", rank=1), {}), 1)
+        self.assertEqual(analysis.heat(row("https://www.reddit.com/r/x/comments/1/", rank=26), {}), 0)
+        self.assertEqual(analysis.heat(row("https://www.v2ex.com/t/1", comments=20), {}), 0.5)
+        scores = card("x")["scores"]
+        self.assertEqual(analysis.lane({"scores": dict(scores, traction=4)}, 0), "validated")
+        self.assertEqual(analysis.lane({"scores": dict(scores, traction=3)}, 0.9), "hot")
+        self.assertEqual(analysis.lane({"scores": dict(scores, traction=1)}, 0.5), "hot")
+        self.assertEqual(analysis.lane({"scores": dict(scores, traction=1, novelty=4)}, 0), "interesting")
+        self.assertEqual(analysis.lane({"scores": dict(scores, traction=1)}, 0), "other")
+        products = [{"id": i} for i in ("o", "i", "h", "v1", "v2", "v3")]
+        lanes = {"o": "other", "i": "interesting", "h": "hot", "v1": "validated", "v2": "validated", "v3": "validated"}
+        sources = {"o": "a", "i": "b", "h": "c", "v1": "r", "v2": "r", "v3": "r"}
+        order = analysis.featured_order(products, lanes, {"v1": 9, "v2": 8, "v3": 7}, sources, 4, 2)
+        self.assertEqual([p["id"] for p in order], ["v1", "v2", "h", "i", "v3", "o"])
+        pool = [{"id": "hot", "name": "Hot", "lane": "hot", "signals": {"heat": 0.9}},
+                {"id": "val", "name": "Val", "lane": "validated", "signals": {"heat": 0}},
+                {"id": "warm", "name": "Warm", "lane": "hot", "signals": {"heat": 0.6}},
+                {"id": "fun", "name": "Fun", "lane": "interesting", "signals": {"heat": 0}},
+                {"id": "meh", "name": "Meh", "lane": "other", "signals": {"heat": 0}}]
+        picks = [{"id": "fun"}, {"id": "meh"}, {"id": "warm"}, {"id": "val"}]
+        result = analysis.ensure_priority(picks, 4, pool, set(), share=0.75)
+        self.assertEqual([r["id"] for r in result], ["fun", "warm", "val", "hot"])
+        self.assertEqual(analysis.ensure_priority(picks, 4, pool, {"hot"}, share=0.75), picks)
+        self.assertEqual(analysis.signal_text(row("https://github.com/a/b", 886, rank=2), "GitHub Trending"),
+                         "GitHub Trending 榜单第 2 位，今日新增 886 stars")
+
+    def test_stream_is_assembled_without_reasoning(self):
+        lines = [b": keep-alive\n", b"\n",
+                 b'data: {"id":"r1","model":"m","choices":[{"delta":{"reasoning_content":"thinking"}}]}\n',
+                 b'data: {"id":"r1","model":"m","choices":[{"delta":{"content":"{\\"a\\":"}}]}\n',
+                 b'data: {"id":"r1","model":"m","choices":[{"delta":{"content":"1}"},"finish_reason":"stop"}]}\n',
+                 b'data: {"id":"r1","model":"m","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n',
+                 b"data: [DONE]\n"]
+        response = analysis.read_stream(iter(lines))
+        self.assertEqual(json.loads(response["choices"][0]["message"]["content"]), {"a": 1})
+        self.assertEqual((response["choices"][0]["finish_reason"], response["usage"]["completion_tokens"]), ("stop", 2))
+
+    def test_comments_are_ranked_and_author_replies_marked(self):
+        hn = {"author": "maker", "children": [
+            {"author": "a", "text": "<p>Looks like Handy</p>", "children": []},
+            {"author": "maker", "text": "Thanks, pricing is $5", "children": []},
+            {"author": "b", "text": "Why not use the OS dictation?", "children": [{"children": []}, {"children": []}]}]}
+        atom = ("<feed xmlns='http://www.w3.org/2005/Atom'>"
+                "<entry><author><name>/u/op</name></author><content>post body</content></entry>"
+                "<entry><author><name>/u/x</name></author><content>&lt;p&gt;First top comment&lt;/p&gt;</content></entry>"
+                "<entry><author><name>/u/op</name></author><content>reply from op</content></entry></feed>")
+        original = analysis.fetch_raw
+        analysis.fetch_raw = lambda url, cfg, timeout: (json.dumps(hn).encode() if "algolia" in url else atom.encode())
+        try:
+            rows = analysis.parse_comments("https://news.ycombinator.com/item?id=1", {})
+            self.assertEqual(rows[0]["text"], "Why not use the OS dictation?")
+            self.assertEqual([r["by_author"] for r in rows], [False, False, True])
+            rows = analysis.parse_comments("https://www.reddit.com/r/x/comments/abc/title/", {})
+            self.assertEqual([(r["text"], r["by_author"]) for r in rows],
+                             [("First top comment", False), ("reply from op", True)])
+            self.assertIsNone(analysis.parse_comments("https://example.org/post", {}))
+        finally:
+            analysis.fetch_raw = original
+        evidence = analysis.comment_evidence("p_1", "https://x", rows, 1000)
+        self.assertEqual((evidence["id"], evidence["text"].count("[作者回复]")), ("p_1:comments", 1))
+
+    def test_deep_validator_ties_community_feedback_to_comment_evidence(self):
+        def product(feedback):
+            record = {k: "内容" for k in ("id", "name", "one_liner", "positioning", "workflow", "value_proposition",
+                                          "alternatives", "differentiation", "pricing_fact", "business_stage", "watch_reason")}
+            record.update(id="p_1", core_features=[{"text": "功能", "evidence_ids": ["p_1:source"]}],
+                          customer_segments=[{"segment": "s", "role": "r", "scenario": "c", "need": "n", "basis": "b",
+                                              "evidence_ids": ["p_1:source"]}],
+                          derived_thoughts=[{"title": "t", "analysis": "a", "takeaway": "k", "applies_when": "w",
+                                             "evidence_ids": ["p_1:source"]}],
+                          community_feedback=feedback, risks=[], unknowns=[],
+                          reception={"signals": "120 分", "why": "推断", "evidence_ids": []})
+            return {"products": [record]}
+        quote = [{"type": "质疑", "text": "有评论者质疑", "evidence_ids": ["p_1:comments"]}]
+        analysis.deep_validator({"p_1": {"p_1:source", "p_1:comments"}})(product(quote))
+        analysis.deep_validator({"p_1": {"p_1:source"}})(product([]))
+        with self.assertRaises(ValueError):
+            analysis.deep_validator({"p_1": {"p_1:source"}})(product(quote))
+        with self.assertRaises(ValueError):
+            analysis.deep_validator({"p_1": {"p_1:source", "p_1:comments"}})(
+                product([dict(quote[0], evidence_ids=["p_1:source"])]))
+        with self.assertRaises(ValueError):
+            analysis.deep_validator({"p_1": {"p_1:source", "p_1:comments"}})(product([dict(quote[0], type="热门")]))
+        with self.assertRaises(ValueError):
+            analysis.screen_validator(["p_1"])({"items": [dict(card("p_1"), themes="AI Agent")]})
+        self.assertEqual(analysis.normalize_themes(["ai agent", "不存在的主题", "免费", "免费"]), ["AI Agent", "免费"])
+
+    def test_theme_trends_count_window_and_recent_days(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            db = radar.connect(Path(temporary) / "radar.db")
+            try:
+                analysis.init_db(db)
+                config = radar.read_config(radar.ROOT / "config.json")
+                cutoff = radar.parse_time("2026-10-12T02:00:00Z")
+                rows = [("a", 0, ["AI Agent"]), ("b", 0, ["AI Agent", "免费"]), ("c", 6, ["免费"]),
+                        ("d", 10, ["免费"]), ("e", 30, ["AI Agent"])]
+                with db:
+                    for name, age_days, themes in rows:
+                        seen = cutoff - age_days * 86400
+                        db.execute("INSERT INTO items VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                   ("show_hn", name, name, "https://%s.example/" % name, "https://%s.example/" % name,
+                                    seen, "", 0, 0, seen, seen))
+                        c = dict(card(name), name=name, themes=themes, product_score=50)
+                        db.execute("INSERT INTO screenings VALUES(?,?,?,?,?,?,NULL)",
+                                   (name, "show_hn", name, "h", analysis.packed(c), seen))
+                trends = analysis.theme_trends(db, config, cutoff, 14, 3)
+                tags = {t["tag"]: t for t in trends["tags"]}
+                self.assertEqual((trends["products"], trends["recent_products"], trends["days_with_data"]), (4, 2, 3))
+                self.assertEqual((tags["AI Agent"]["count"], tags["AI Agent"]["recent"]), (2, 2))
+                self.assertEqual((tags["免费"]["count"], tags["免费"]["recent"], tags["免费"]["earlier_share"]), (3, 1, 1.0))
+                lines = "\n".join(analysis.trend_lines(trends, 8))
+                self.assertIn("AI Agent 2（50%） ↑", lines)
+                self.assertIn("免费 3（75%） ↓", lines)
             finally:
                 db.close()
 

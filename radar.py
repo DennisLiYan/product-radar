@@ -106,6 +106,7 @@ class Item:
     description: str = ""
     points: int = 0
     comments: int = 0
+    rank: int = 0  # position on a popularity list (1 = top); 0 when the source is not ranked
 
 
 @dataclass
@@ -343,7 +344,7 @@ def collect_hf_spaces(source, start, end, client):
         raise ValueError("Hugging Face Spaces API 返回结构异常")
     newest = end - int(source.get("max_age_days", 30)) * 86400
     items = []
-    for space in data:
+    for position, space in enumerate(data, 1):
         identity = str(space.get("id") or "")
         if not identity or parse_time(space.get("createdAt")) < newest:
             continue
@@ -354,9 +355,31 @@ def collect_hf_spaces(source, start, end, client):
             details.append("SDK：" + plain(space["sdk"]))
         details.append("%d likes" % int(space.get("likes") or 0))
         items.append(Item(identity.lower(), plain(card.get("title") or identity), url, url, end - 1,
-                          "；".join(x for x in details if x), int(space.get("likes") or 0), 0))
+                          "；".join(x for x in details if x), int(space.get("likes") or 0), 0, position))
     return Batch(items, "limited", "Hugging Face Spaces 热门榜快照，只保留 %d 天内创建的 Space；以 Space ID 去重。"
                  % int(source.get("max_age_days", 30)))
+
+
+def collect_v2ex(source, start, end, client, required_start):
+    """V2EX node API: like the RSS feed, but with reply counts that later runs refresh."""
+    data = client.json(source["url"])
+    if not isinstance(data, list) or not data:
+        raise ValueError("V2EX API 返回空列表，无法确认覆盖范围，检查点不推进")
+    items = []
+    for topic in data:
+        published = int(topic.get("created") or 0)
+        if not topic.get("id") or not start <= published < end:
+            continue
+        url = canonical_url("https://www.v2ex.com/t/%d" % int(topic["id"]))
+        items.append(Item("v2ex:%d" % int(topic["id"]), plain(topic.get("title") or ""), url, url, published,
+                          plain(topic.get("content_rendered") or topic.get("content") or "")[:4000],
+                          0, int(topic.get("replies") or 0)))
+    oldest = min(int(t.get("created") or end) for t in data)
+    if oldest > required_start:
+        gap_end = min(oldest, end)
+        return Batch(items, "limited", "仅有最近 %d 个主题；%s 至 %s 可能有历史缺口，已永久记录。" %
+                     (len(data), stamp(required_start), stamp(gap_end)), (required_start, gap_end))
+    return Batch(items, "limited", "V2EX 节点 API 快照已覆盖本次新增区间；回复数在后续运行中刷新。")
 
 
 def parse_hellogithub_volume(body, issue_url, published_at):
@@ -424,6 +447,8 @@ def collect_github_trending(source, start, end, client):
     if start >= end:
         return Batch([], "limited", "GitHub Trending 是当前排行榜快照；没有可请求的历史区间。")
     items = parse_github_trending(client.get(source["url"]), end - 1)
+    for position, item in enumerate(items, 1):
+        item.rank = position
     return Batch(items, "limited",
                  "GitHub Trending 是当前排行榜快照，不提供发布时间或历史分页；仓库以 owner/repo 去重。")
 
@@ -561,7 +586,9 @@ def collect_betalist(source, start, end, client):
         if signature in seen_pages:
             raise ValueError("BetaList 分页重复，无法确认覆盖范围，检查点不推进")
         seen_pages.add(signature)
-        for item in entries:
+        for position, item in enumerate(entries, 1):
+            if source.get("ranked") and page == 1:
+                item.rank = position  # feed is ordered by popularity, e.g. Reddit top of the day
             if start <= item.published_at < end:
                 selected[item.external_id] = item
         if min(item.published_at for item in entries) <= start:
@@ -584,10 +611,15 @@ def collect_feed(source, start, end, client, required_start):
         if signature in seen_pages:
             raise ValueError("历史分页重复，无法确认覆盖范围，检查点不推进")
         seen_pages.add(signature)
-        for item in entries:
+        for position, item in enumerate(entries, 1):
+            if source.get("ranked") and page == 1:
+                item.rank = position  # feed is ordered by popularity, e.g. Reddit top of the day
             if start <= item.published_at < end:
                 selected[item.external_id] = item
         oldest = min(x.published_at for x in entries)
+        if source.get("ranked"):
+            return Batch(list(selected.values()), "limited",
+                         "热门榜快照：按热度取前 %d 条，名次记录为热度信号；不追求完整覆盖。" % len(entries))
         if source["kind"] == "rss":
             if oldest > required_start:
                 gap_end = min(oldest, end)
@@ -626,6 +658,9 @@ def connect(path):
         first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
         PRIMARY KEY(source_id,external_id));
     CREATE INDEX IF NOT EXISTS items_first_seen ON items(first_seen_at);
+    CREATE TABLE IF NOT EXISTS item_ranks (
+        source_id TEXT NOT NULL, external_id TEXT NOT NULL, rank INTEGER NOT NULL, observed_at INTEGER NOT NULL,
+        PRIMARY KEY(source_id,external_id));
     CREATE TABLE IF NOT EXISTS coverage_gaps (
         id INTEGER PRIMARY KEY, source_id TEXT NOT NULL, since_at INTEGER NOT NULL,
         until_at INTEGER NOT NULL, detected_at INTEGER NOT NULL, note TEXT NOT NULL,
@@ -663,6 +698,8 @@ def collect_source(db, source, cutoff, config, client, run_id):
             batch = collect_yc_launches(source, start, cutoff, client)
         elif source["kind"] == "betalist":
             batch = collect_betalist(source, start, cutoff, client)
+        elif source["kind"] == "v2ex_api":
+            batch = collect_v2ex(source, start, cutoff, client, required_start)
         else:
             raise ValueError("不支持的来源类型：" + source["kind"])
         added = 0
@@ -678,6 +715,10 @@ def collect_source(db, source, cutoff, config, client, run_id):
                            points=?,comments=?,last_seen_at=? WHERE source_id=? AND external_id=?""",
                            (item.title, item.url, item.discussion_url, item.published_at, item.description,
                             item.points, item.comments, cutoff, identity, item.external_id))
+                if item.rank:
+                    db.execute("""INSERT INTO item_ranks VALUES(?,?,?,?) ON CONFLICT(source_id,external_id)
+                               DO UPDATE SET rank=MIN(rank,excluded.rank),observed_at=excluded.observed_at""",
+                               (identity, item.external_id, item.rank, cutoff))
             db.execute("UPDATE sources SET cursor_at=?,last_attempt_at=?,last_status=?,last_error=NULL WHERE id=?",
                        (cutoff, cutoff, batch.status, identity))
             if batch.gap and batch.gap[0] < batch.gap[1]:
@@ -847,12 +888,22 @@ def run(root, config, if_due=False):
         with db:
             db.execute("UPDATE runs SET status='interrupted' WHERE status='running'")
             db.execute("INSERT INTO runs(id,started_at,cutoff_at,status) VALUES(?,?,?,'running')", (identity, cutoff, cutoff))
-        statuses = {}
+        statuses, host_started = {}, {}
+
+        def pace(source):
+            # Sites such as Reddit rate-limit back-to-back feeds; space sources that share a host.
+            host = urllib.parse.urlsplit(source["url"]).hostname or ""
+            wait = config.get("host_interval_seconds", {}).get(host, 0) - (time.monotonic() - host_started.get(host, -1e9))
+            if wait > 0:
+                time.sleep(wait)
+            host_started[host] = time.monotonic()
+
         for source in config["sources"]:
             if not source.get("enabled", True):
                 continue
             if statuses:
                 time.sleep(config.get("source_start_interval_seconds", 0))
+            pace(source)
             client = HTTPClient(config, root / "data/raw" / identity / source["id"])
             statuses[source["id"]] = collect_source(db, source, cutoff, config, client, identity)
         failed = [s for s in config["sources"] if statuses.get(s["id"]) == "failed"]
@@ -862,6 +913,7 @@ def run(root, config, if_due=False):
             LOG.info("%d 个来源失败，%d 秒后重试一轮", len(failed), retry_wait)
             time.sleep(retry_wait)
             for source in failed:
+                pace(source)
                 client = HTTPClient(config, root / "data/raw" / identity / (source["id"] + "-retry"))
                 statuses[source["id"]] = collect_source(db, source, cutoff, config, client, identity)
         statuses = list(statuses.values())

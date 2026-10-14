@@ -7,6 +7,9 @@
 4. derived_thoughts 应是从该产品延伸出的功能、定位、客户、行业应用、分发或产品边界思考，不要改写成 MVP 与七天实验计划。
 5. 只允许在 evidence_ids 数组里写内部证据 ID；任何文本字段中都不能出现 p_xxx:source 或 p_xxx:page。
 6. 每个引用必须属于对应产品。保留具体细节与有价值的反面判断，不要用免责声明淹没内容。
+7. reception.signals 中的热度数字必须与 evidence 里 market_signals.popularity 一致，用户数、收入等必须能在证据中找到并注明自述；reception.why 是推断，要指出最关键的因素，不能把推断写成事实。任何文本字段中出现 market_signals、popularity、heat、lane 等字段名或 0—1 的热度值时，改写为自然语言。
+8. community_feedback 必须能在 :comments 证据里找到对应评论，不能把一位评论者的看法写成多数意见；作者本人的回复只能标为“作者回应”。没有 :comments 证据时必须为空数组。
+9. derived_thoughts 的 takeaway 必须是具体可执行的做法，不是态度或原则；applies_when 要写出适用与不适用的条件。recent_thoughts 是最近几天写过的思考标题，other_products_today 是今天其他重点产品的思考标题；若某条思考与它们角度相同或相近（例如反复出现的“克制定位/写清楚不做什么/边界清楚赢得信任”），用本产品资料中另一个更具体的角度改写，例如核心机制、分发、定价、切换成本或评论中暴露的问题。
 
 返回与输入 products 完全相同的字段结构和产品顺序。不要返回质量说明或其他字段。
 

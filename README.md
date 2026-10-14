@@ -49,7 +49,7 @@ python3 radar.py feedback <反馈ID或产品名> good|bad --note "原因"   # �
 | 文件 | 内容 |
 |---|---|
 | `latest.md` | 最新短报，与当天 `daily.md` 一致 |
-| `reports/YYYY-MM-DD/daily.md` | 每日短报：默认 4 个重点产品 + 最多 2 条跨产品思考，约 6000 字符以内 |
+| `reports/YYYY-MM-DD/daily.md` | 每日短报：默认 4 个重点产品（按“已获市场验证 → 当前热门 → 功能有意思”排序，含市场反响分析与社区反馈）+ 最多 2 条跨产品思考 + 主题走势，约 7500 字符以内 |
 | `reports/YYYY-MM-DD/products.md` | 约 12 份完整重点产品档案 |
 | `reports/YYYY-MM-DD/catalog.md` | 当天全部新增产品的卡片 |
 | `reports/YYYY-MM-DD/collection.md` | 原始采集清单与覆盖缺口 |
@@ -65,7 +65,7 @@ python3 radar.py feedback <反馈ID或产品名> good|bad --note "原因"   # �
 | YC 公司目录更新（默认停用） | YC 官方 companies sitemap | 只有网址缩写、没有产品描述，实测卡片全部低置信度，默认停用；`lastmod` 是页面更新日，不等于产品发布日期 |
 | Product Hunt | 官方 Atom 订阅 | 仅近期条目，无需 API 令牌 |
 | GitHub Trending | 解析每日热门页面 | 当前榜单快照；用 `owner/repo` 稳定去重，没有历史补抓能力 |
-| Reddit r/SideProject、r/SaaS、r/indiehackers、r/microsaas、r/alphaandbetausers | 子版块 RSS 订阅 | 仅近期条目；来源独立重试与记录缺口 |
+| Reddit r/SideProject、r/SaaS、r/indiehackers、r/microsaas、r/alphaandbetausers | 子版块“今日热门”RSS（`top/.rss?t=day`） | 每天按热度取前 25 条，名次作为热度信号（Reddit 的 JSON 接口对匿名请求返回 403，RSS 不含分数） |
 | HN 月度帖 “Ask HN: What are you working on?” | Algolia HN Search API | 读取近 45 天内月度帖的一级回复，每条回复视为一个产品自述；默认只保留至少 80 字符且带产品链接的回复。新帖发布后几天内回复量较大 |
 | HelloGitHub 月刊 | 月刊 RSS + 期刊页面内嵌数据 | 每期拆分为单个开源项目，以 `owner/repo` 去重 |
 | Hugging Face Spaces 热门 | 官方公开 API | 当前热门榜快照，只保留 30 天内创建的 Space，没有历史补抓能力 |
@@ -74,7 +74,7 @@ python3 radar.py feedback <反馈ID或产品名> good|bad --note "原因"   # �
 | TechCrunch Startups | 频道 RSS | 偏融资与公司新闻，正文只有摘要 |
 | BetaList | 带日期的产品列表分页 | 按发布日期逐页回溯到检查点；用产品 slug 去重 |
 | 小众软件 | 站点 RSS，`feed/?paged=N` | 逐页回溯到时间起点；分页失效时报告失败而不跳过 |
-| V2EX 分享创造 | 节点 Atom 订阅 | 仅近期约 50 条，可能缺失的区间会明确记录 |
+| V2EX 分享创造 | 节点 API（`/api/topics/show.json`） | 仅近期约 20 个主题，带回复数；可能缺失的区间会明确记录 |
 
 Indie Hackers Products、Uneed、Peerlist Launchpad 已在配置中保留占位，但因没有适合独立定时程序的稳定公开产品 API/RSS，或自动请求被 Cloudflare 拦截，默认**未启用**。Lobsters Show（`lobste.rs/t/show.rss`）已加入配置但默认停用：在部分网络环境下无法连接，可达时将 `enabled` 改为 `true` 即可。36 氪的订阅地址目前返回反爬验证页，未接入。Reddit 的 r/startups feed 持续返回 429，也暂时停用；r/SideProject、r/SaaS、r/indiehackers 与 HN 创业讨论继续覆盖相邻信号。
 
@@ -98,12 +98,12 @@ Indie Hackers Products、Uneed、Peerlist Launchpad 已在配置中保留占位�
 每天的条目经过一个逐层收窄的漏斗：越便宜的环节越先过滤，模型只在值得的地方花算力。
 
 1. **补充首页摘要（不调用模型）**：来源只给标题或简介很短的条目，先读取产品首页的标题、描述标签和开头正文，作为 `page_preview` 一起交给模型。讨论站（HN、Reddit、V2EX）不抓取；首页缓存一天，深读阶段复用。
-2. **逐条产品卡片**：模型说明每条是什么、核心功能、定位、客户、场景和阶段，并按 5 个有锚点的维度各打 1—5 分：信息具体度、定位清晰度、客户明确度、形态新意、对小团队的借鉴价值。总分由程序按 `score_weights` 加权算出，不让模型直接给笼统分数。
-3. **程序排序与截断**：总分 + 来源内热度排名（不同平台的点赞数不直接比较）+ 跨来源出现加分。同一产品官网（或 GitHub 仓库、HF Space）在多个来源出现时合并为一张卡片。每个类别保留最低名额后，取前 `select_pool_size`（默认 60）张作为候选池。
-4. **模型精选**：只在候选池里挑约 12 个值得深读的产品，同时参考近 30 天已入选产品（避免重复）和你的反馈样例。
-5. **补充证据并深读**：抓取重点产品的公开页面，开启思考模式研究功能、客户、流程、价值、替代方案、差异点、收费与衍生思考。
-6. **逐份产品复核**：第二轮模型检查每份档案，收窄缺乏证据的确定性表述。
-7. **横向编辑与综合复核**：基于候选池、复核后档案和近 7 天日报形成跨产品判断，再检查引用和措辞。
+2. **逐条产品卡片**：模型说明每条是什么、核心功能、定位、客户、场景和阶段，并按 6 个有锚点的维度各打 1—5 分：信息具体度、定位清晰度、客户明确度、形态新意、对小团队的借鉴价值、证据与牵引力（真实用户、收入、可试用、社区反响）。总分由程序按 `score_weights` 加权算出，牵引力权重最高，定位清晰度最低，避免“帖子写得好”压过“产品有人用”。每张卡片还会从固定词表里打 1—4 个主题标签（如浏览器扩展、一次买断、AI Agent），供跨天统计。
+3. **程序排序与截断**：先按平台算出 0—1 的热度（HN 分数与评论数、GitHub 今日新增 stars、V2EX 回复数、Reddit / GitHub / HF 榜单名次），再把每张卡片归入三条通道，对应读者的关注优先级：**已获市场验证**（有具体用户、付费、收入等证据，或热度高且有可用产品）、**当前热门**（平台内热度靠前）、**功能有意思**（新意与定位都高）。排序分 = 卡片总分 + 热度加分 + 通道加分 + 跨来源出现加分。同一产品官网（或 GitHub 仓库、HF Space）在多个来源出现时合并为一张卡片。每个类别保留最低名额后，取前 `select_pool_size`（默认 60）张作为候选池。
+4. **模型精选**：只在候选池里挑约 12 个值得深读的产品，按通道优先级选择，同时参考近 30 天已入选产品（避免重复）和你的反馈样例。
+5. **补充证据并深读**：抓取重点产品的公开页面，以及来源讨论区的一级评论（HN 经 Algolia API、Reddit 经评论 RSS、V2EX 经回复 API，按互动排序，作者本人的回复会单独标出）。然后开启思考模式，研究功能、客户、流程、价值、替代方案、差异点、收费；写出“市场反响”（程序给出的热度数字 + 自述的用户与收入 + 评论态度，并分析为什么会获得这样的反响）和“社区反馈”（质疑、竞品对比、使用反馈、付费意愿等）。衍生思考要写出可复用的做法和适用条件，并避开近 7 天已经写过的角度。
+6. **逐份产品复核**：第二轮模型检查每份档案，收窄缺乏证据的确定性表述，核对社区反馈确实出自评论，并改写与其他产品或近几天重复的思考角度。
+7. **横向编辑与综合复核**：基于候选池、复核后档案、近 7 天日报和程序统计的近 14 天主题走势形成跨产品判断，谈现象时引用具体数字，再检查引用、数字和措辞。日报末尾的“主题走势”由程序直接从卡片统计，不经模型。
 8. **短报与档案分离**：后台保留完整档案，`daily.md` 只摘取最重要的部分。
 
 ### 持续调优
@@ -132,6 +132,8 @@ Indie Hackers Products、Uneed、Peerlist Launchpad 已在配置中保留占位�
 | `top_n`、`preferred_keywords` | 原始采集精选数量和排序偏好，只影响排序不影响收录 |
 | `max_requests_per_source` | 单次任务每个来源的请求上限，默认 200 |
 | `source_start_interval_seconds` | 不同来源之间的间隔，默认 2 秒，避免同一平台的多个 feed 连续触发限流 |
+| `host_interval_seconds` | 同一站点的来源之间至少间隔多少秒，默认 Reddit 15 秒 |
+| `retry_failed_after_seconds` | 采集失败的来源在本轮结束后等待多少秒再重试一次，默认 90；设为 -1 关闭 |
 | `proxy_enabled` | 代理总开关。`true` 时使用 `proxy_url`，`false` 时完全忽略该地址并直连 |
 | `proxy_url` | HTTP(S) 代理地址；当前为本机 `127.0.0.1:1087`，启用后由采集、产品页读取和 DeepSeek 共用，launchd 无需继承终端环境 |
 | `sources[].enabled` | 启用或停用某个来源 |
@@ -142,17 +144,23 @@ Indie Hackers Products、Uneed、Peerlist Launchpad 已在配置中保留占位�
 | `llm.preview_pages` | 是否为简介不足的条目读取首页摘要，默认开启（受 `fetch_product_pages` 总开关控制） |
 | `llm.preview_below_chars`、`preview_max_chars` | 简介少于多少字符时读取首页（默认 200）；摘要最多保留多少字符（默认 600） |
 | `llm.preview_timeout_seconds`、`preview_concurrency` | 首页读取超时（默认 8 秒）与并发数（默认 8） |
-| `llm.score_weights` | 5 个评分维度的权重，默认各 0.2 |
+| `llm.score_weights` | 6 个评分维度的权重，默认牵引力 0.25、新意 0.2、具体度 / 客户 / 借鉴价值各 0.15、定位 0.1 |
+| `llm.fetch_comments` | 是否为重点产品读取讨论区评论，默认开启（受 `fetch_product_pages` 总开关控制） |
+| `llm.comments_max`、`comments_max_chars` | 每个产品最多读取的一级评论数（默认 30）与交给模型的评论总字符数（默认 6000） |
+| `llm.trend_window_days` | 主题走势统计窗口，默认 14 天 |
 | `llm.select_pool_size`、`min_per_category` | 交给模型精选的候选池大小（默认 60）与每个类别最低名额（默认 2） |
 | `llm.max_source_share`、`max_category_share` | 候选池中单个来源 / 单个类别的最高占比（默认 0.4 / 0.35）；候选不足时自动放宽 |
 | `llm.max_pick_share` | 精选的重点产品中单个来源 / 单个类别最多占比（默认 0.4，即 12 个中最多 5 个），由程序校验 |
-| `llm.engagement_bonus`、`cross_source_bonus` | 来源内热度排名最高加分（默认 10）；每多一个来源出现加分（默认 8，最多计 2 个） |
+| `llm.heat_bonus`、`lane_bonus`、`cross_source_bonus` | 热度满分时的加分（默认 35）；各通道加分（默认已获验证 25、热门 15、有意思 8）；每多一个平台出现加分（默认 8，最多计 2 个） |
+| `llm.heat_scale`、`rank_depth` | 各平台“热度满分”的分数与评论数门槛（如 HN 150 分 / 80 评论）；榜单名次的计算深度（默认 25） |
+| `llm.featured_per_source` | 短报展示的重点产品中同一平台（如 Reddit 各版块合计）最多几个，默认 2 |
+| `llm.priority_share`、`priority_min_heat` | 深读名单中“已获验证 / 高热度”产品至少占比（默认 0.5），以及被程序强制补入的热度门槛（默认 0.8）；模型漏选时由程序补入 |
 | `llm.feedback_examples` | 交给精选环节的最近反馈条数，默认 20 |
 | `llm.max_items_per_run`、`max_calls_per_run` | 单次处理上限，默认 1200 条 / 120 次请求（含重试） |
 | `llm.enabled` | 设为 `false` 时只生成原始采集日报 |
 | `report.daily_feature_count` | 短报重点产品数，默认 4 |
 | `report.daily_insight_count` | 短报跨产品思考数，默认 2 |
-| `report.daily_max_chars` | 短报字符上限，默认 6000 |
+| `report.daily_max_chars` | 短报字符上限，默认 7500 |
 | `report.repeat_suppression_days` | 重点产品跨日去重窗口，默认 30 天 |
 
 ### 代理开关

@@ -10,13 +10,14 @@
   "request_interval_seconds": 0.4,
   "source_start_interval_seconds": 2,
   "retry_failed_after_seconds": 90,
+  "host_interval_seconds": {"www.reddit.com": 15},
   "max_requests_per_source": 200,
   "proxy_enabled": true,
   "proxy_url": "http://127.0.0.1:1087",
   "report": {
     "daily_feature_count": 4,
     "daily_insight_count": 2,
-    "daily_max_chars": 6000,
+    "daily_max_chars": 7500,
     "repeat_suppression_days": 30
   },
   "llm": {
@@ -44,13 +45,13 @@
     "preview_max_chars": 600,
     "preview_timeout_seconds": 8,
     "preview_concurrency": 8,
-    "score_weights": {"specificity": 0.2, "positioning": 0.2, "customer": 0.2, "novelty": 0.2, "learnability": 0.2},
+    "score_weights": {"specificity": 0.15, "positioning": 0.1, "customer": 0.15, "novelty": 0.2, "learnability": 0.15, "traction": 0.25},
     "select_pool_size": 60,
     "min_per_category": 2,
     "max_source_share": 0.4,
     "max_category_share": 0.35,
     "max_pick_share": 0.4,
-    "engagement_bonus": 10,
+    "heat_bonus": 35,
     "cross_source_bonus": 8,
     "feedback_examples": 20
   },
@@ -107,24 +108,27 @@
     },
     {
       "id": "reddit_sideproject",
-      "name": "Reddit r/SideProject",
+      "name": "Reddit r/SideProject 今日热门",
       "kind": "rss",
       "enabled": true,
-      "url": "https://www.reddit.com/r/SideProject/new/.rss"
+      "ranked": true,
+      "url": "https://www.reddit.com/r/SideProject/top/.rss?t=day&limit=25"
     },
     {
       "id": "reddit_saas",
-      "name": "Reddit r/SaaS",
+      "name": "Reddit r/SaaS 今日热门",
       "kind": "rss",
       "enabled": true,
-      "url": "https://www.reddit.com/r/SaaS/new/.rss"
+      "ranked": true,
+      "url": "https://www.reddit.com/r/SaaS/top/.rss?t=day&limit=25"
     },
     {
       "id": "reddit_indiehackers",
-      "name": "Reddit r/indiehackers",
+      "name": "Reddit r/indiehackers 今日热门",
       "kind": "rss",
       "enabled": true,
-      "url": "https://www.reddit.com/r/indiehackers/new/.rss"
+      "ranked": true,
+      "url": "https://www.reddit.com/r/indiehackers/top/.rss?t=day&limit=25"
     },
     {
       "id": "reddit_startups",
@@ -136,17 +140,19 @@
     },
     {
       "id": "reddit_microsaas",
-      "name": "Reddit r/microsaas",
+      "name": "Reddit r/microsaas 今日热门",
       "kind": "rss",
       "enabled": true,
-      "url": "https://www.reddit.com/r/microsaas/new/.rss"
+      "ranked": true,
+      "url": "https://www.reddit.com/r/microsaas/top/.rss?t=day&limit=25"
     },
     {
       "id": "reddit_alphaandbetausers",
-      "name": "Reddit r/alphaandbetausers",
+      "name": "Reddit r/alphaandbetausers 今日热门",
       "kind": "rss",
       "enabled": true,
-      "url": "https://www.reddit.com/r/alphaandbetausers/new/.rss"
+      "ranked": true,
+      "url": "https://www.reddit.com/r/alphaandbetausers/top/.rss?t=day&limit=25"
     },
     {
       "id": "hn_working_on",
@@ -214,9 +220,9 @@
     {
       "id": "v2ex_create",
       "name": "V2EX 分享创造",
-      "kind": "rss",
+      "kind": "v2ex_api",
       "enabled": true,
-      "url": "https://www.v2ex.com/feed/create.xml"
+      "url": "https://www.v2ex.com/api/topics/show.json?node_name=create"
     },
     {
       "id": "indie_hackers_products",
