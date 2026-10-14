@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from zoneinfo import ZoneInfo
@@ -117,7 +118,7 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(self.db.execute("SELECT cursor_at FROM sources").fetchone()[0], self.now + 86400)
 
     def test_run_retries_failed_sources_after_a_pause(self):
-        responses = [(503, b"waking up"), (200, rss([("fresh", self.now - 10)]))]
+        responses = [(503, b"waking up"), (200, rss([("fresh", int(time.time()) - 10)]))]
         with Server(lambda p: responses.pop(0) if len(responses) > 1 else responses[0]) as server:
             source = {"id": "test", "name": "Test", "kind": "rss", "url": server.url}
             self.config.update(sources=[source], retry_failed_after_seconds=0, llm={"enabled": False})
